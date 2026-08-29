@@ -359,6 +359,28 @@ html, body {
   <div class="subtitle">点击麦克风键说话 · 静音自动断句 · 译音播完可继续说</div>
 </div>
 
+<!-- ══ 调试面板：不用开发者工具也能看麦克风是否真的在收音 ══ -->
+<div id="debugPanel" style="position:fixed;left:8px;bottom:8px;z-index:9999;
+  background:rgba(0,0,0,0.75);color:#0f0;font:11px/1.5 monospace;
+  padding:8px 10px;border-radius:6px;max-width:260px;white-space:pre;">
+调试面板加载中...
+</div>
+<script>
+function updateDebugPanel(rms) {
+  const panel = document.getElementById('debugPanel');
+  if (!panel) return;
+  const track = mediaStream ? mediaStream.getAudioTracks()[0] : null;
+  panel.textContent =
+`麦克风轨道: ${track ? track.readyState : '无'} / muted=${track ? track.muted : '?'}
+onaudioprocess调用次数: ${debugFrameCount}
+已发送音频包数: ${debugChunksSent}
+当前RMS: ${rms.toFixed(5)}
+本段最大RMS: ${debugMaxRms.toFixed(5)} (阈值 ${SILENCE_THRESHOLD})
+isSpeaking: ${isSpeaking}`;
+}
+</script>
+
+
 <!-- ══ 通话屏幕 ══ -->
 <div id="callScreen" class="screen">
 
@@ -445,11 +467,13 @@ let readyA = false, readyB = false;
 
 const SILENCE_THRESHOLD = 0.005;
 const SILENCE_FRAMES_MAX = 30;
-const MAX_RECORDING_MS = 15000;   // 兜底：即使检测不到静音，说话超过15秒也强制断句
+const MAX_RECORDING_MS = 15000;
 let silenceFrames = 0;
 let isSpeaking = false;
 let recordingStartTime = 0;
-let debugMaxRms = 0;   // 调试用：本次录音期间观察到的最大音量
+let debugMaxRms = 0;
+let debugFrameCount = 0;
+let debugChunksSent = 0;
 let sampleRate = 16000;
 
 let playCtx = null;
@@ -559,15 +583,18 @@ async function ensureMic() {
       if (audioPlaying) return;
       const ws = recordingRole === 'a' ? wsA : wsB;
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      debugFrameCount++;
       const data = e.inputBuffer.getChannelData(0);
       const pcm = downsampleTo16k(data, sampleRate);
       const b64 = pcmToBase64(pcm);
       ws.send(JSON.stringify({ type: 'audio', data: b64 }));
+      debugChunksSent++;
 
       let sum = 0;
       for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
       const rms = Math.sqrt(sum / data.length);
       if (rms > debugMaxRms) debugMaxRms = rms;
+      updateDebugPanel(rms);
 
       if (rms > SILENCE_THRESHOLD) {
         silenceFrames = 0;
@@ -625,6 +652,8 @@ async function startRecording(role) {
   silenceFrames = 0;
   recordingStartTime = Date.now();
   debugMaxRms = 0;
+  debugFrameCount = 0;
+  debugChunksSent = 0;
   refreshMicUI();
   statusBar.textContent = `🎤 ${role.toUpperCase()} 说话中...`;
 }
