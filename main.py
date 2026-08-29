@@ -1,388 +1,426 @@
-import os
+"""
+双向实时语音互译桥接服务 — AB双麦克风键版
+设计原则：
+  - A点A键、B点B键，各自声明说话权
+  - 扬声器串行播放：原音→译音，播完才解锁对方键
+  - 麦克风冲突由人解决（听到沉默才点键）
+  - 扬声器冲突由系统解决（串行队列）
+  - 两个逻辑通道，同一时刻只有一个工作，只付一份token
+"""
+import asyncio
 import json
+import os
+import sys
+import uuid
 import time
 import base64
-import asyncio
-import logging
-import requests
 from typing import Dict, Optional
-from fastapi import FastAPI, WebSocketDisconnect, WebSocket
-from fastapi.responses import HTMLResponse
-from contextlib import asynccontextmanager
+from datetime import datetime
 
-import dashscope
-from dashscope.audio.asr import Recognition, RecognitionCallback
-from dashscope.audio.tts_v2 import SpeechSynthesizer
+import websockets
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.staticfiles import StaticFiles
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+def log(msg: str, level: str = "INFO"):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    out = sys.stderr if level in ["ERROR", "WARNING"] else sys.stdout
+    print(f"[{timestamp}] [{level}] {msg}", file=out)
+    sys.stdout.flush()
 
 # ── 环境变量 ──────────────────────────────────────────────
-DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY")
-dashscope.api_key = DASHSCOPE_API_KEY
+DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
+WORKSPACE_ID = os.environ.get("WORKSPACE_ID", "")
+REGION = os.environ.get("REGION", "cn-beijing")
+MODEL = os.environ.get("MODEL", "qwen3-translation-realtime-v1")
+SILENCE_PCM = base64.b64encode(b"\x00" * 3200).decode()
 
-if not DASHSCOPE_API_KEY:
-    logger.warning("⚠️ 环境变量 DASHSCOPE_API_KEY 未设置！")
-
-# ── 模型配置 ──────────────────────────────────────────────
-ASR_MODEL = "fun-asr-realtime"
-TRANSLATE_URL = "https://dashscope.aliyuncs.com/api/v1/services/machine-translation/translation"
-TRANSLATE_MODEL = "qwen-mt-turbo"
-TTS_MODEL = "cosyvoice-v2"
-TTS_VOICE = "longxiaochun_v2"
-
-# ── 语言映射 ──────────────────────────────────────────────
-LANG_MAP = {
-    "zh": "zh", "en": "en", "ja": "ja", "ko": "ko",
-    "fr": "fr", "de": "de", "es": "es", "ru": "ru"
-}
-
-rooms: Dict[str, Dict] = {}
-
-# ── 音频看门狗配置 ─────────────────────────────────────────
-WATCHDOG_CHECK_INTERVAL = 5
-WATCHDOG_IDLE_TIMEOUT = 15
-
-
-# ── ASR 回调 ──────────────────────────────────────────────
-class StreamingCallback(RecognitionCallback):
-    def __init__(self, client_id: str, loop: asyncio.AbstractEventLoop, room_id: str):
-        self.client_id = client_id
-        self.loop = loop
-        self.room_id = room_id
-        self.is_broken = False
-
-    def on_open(self):
-        logger.info(f"✅ ASR 流式会话已建立: {self.client_id}")
-
-    def on_close(self):
-        self.is_broken = True
-        logger.info(f"ASR 流式会话已关闭: {self.client_id}")
-
-    def on_complete(self):
-        logger.info(f"ASR 流式会话正常结束: {self.client_id}")
-
-    def on_error(self, result):
-        self.is_broken = True
-        error_msg = "未知错误"
-        try:
-            error_msg = str(result) if result else "未知错误"
-            if hasattr(result, 'status_code'):
-                error_msg = f"status_code={result.status_code}, {error_msg}"
-            if hasattr(result, 'message'):
-                error_msg = f"message={result.message}, {error_msg}"
-        except Exception as e:
-            error_msg = f"无法解析错误详情: {e}"
-        logger.error(f"❌ ASR 错误: {error_msg}")
-
-        try:
-            asyncio.run_coroutine_threadsafe(
-                self._notify_error(error_msg),
-                self.loop
-            )
-        except Exception as e:
-            logger.error(f"通知前端 ASR 错误失败: {e}")
-
-    async def _notify_error(self, msg):
-        room_id = self.room_id
-        client_id = self.client_id
-        if room_id in rooms and client_id in rooms[room_id]["clients"]:
-            ws = rooms[room_id]["clients"][client_id]
-            try:
-                await ws.send_text(json.dumps({
-                    "type": "asr_error",
-                    "msg": f"ASR 错误: {msg}"
-                }))
-            except Exception:
-                pass
-
-    def on_event(self, result):
-        try:
-            sentence = result.get_sentence()
-        except Exception as e:
-            logger.error(f"解析识别结果失败: {e}")
-            return
-        if not sentence:
-            return
-        if isinstance(sentence, list):
-            for s in sentence:
-                self._handle_sentence(s)
-        else:
-            self._handle_sentence(sentence)
-
-    def _handle_sentence(self, sentence):
-        if isinstance(sentence, dict):
-            text = (sentence.get("text") or "").strip()
-            is_end = bool(sentence.get("sentence_end", False))
-        else:
-            text = str(getattr(sentence, "text", "")).strip()
-            is_end = bool(getattr(sentence, "sentence_end", False))
-        if not text:
-            return
-
-        if is_end:
-            logger.info(f"📝 ASR 断句完成 [{self.client_id}]: '{text}'")
-        else:
-            logger.info(f"📝 ASR 中间结果 [{self.client_id}]: '{text}'")
-
-        asyncio.run_coroutine_threadsafe(
-            handle_asr_result(self.client_id, text, self.room_id, is_end),
-            self.loop
-        )
-
-
-# ── 翻译（阻塞调用） ──────────────────────────────────────
-def _translate_text_blocking(text: str, target_lang: str) -> str:
-    if not text or not DASHSCOPE_API_KEY:
-        return text
-    target = LANG_MAP.get(target_lang, "en")
-    headers = {"Authorization": f"Bearer {DASHSCOPE_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": TRANSLATE_MODEL,
-        "input": {"text": text, "source_lang": "auto", "target_lang": target}
-    }
-    try:
-        resp = requests.post(TRANSLATE_URL, headers=headers, json=payload, timeout=30)
-        if resp.status_code == 200:
-            result = resp.json().get("output", {}).get("text", text)
-            logger.info(f"🌐 翻译结果 ({target_lang}): {result}")
-            return result
-        logger.error(f"翻译请求失败: status={resp.status_code}, body={resp.text[:300]}")
-        return text
-    except Exception as e:
-        logger.error(f"翻译异常: {e}")
-        return text
-
-
-async def translate_text(text: str, target_lang: str) -> str:
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _translate_text_blocking, text, target_lang)
-
-
-# ── TTS（阻塞调用） ──────────────────────────────────────
-def _synthesize_speech_blocking(text: str) -> Optional[bytes]:
-    if not text or not DASHSCOPE_API_KEY:
-        return None
-    try:
-        synthesizer = SpeechSynthesizer(model=TTS_MODEL, voice=TTS_VOICE)
-        audio = synthesizer.call(text)
-        logger.info(f"🔊 TTS 合成成功: {text[:30]}...")
-        return audio
-    except Exception as e:
-        logger.error(f"TTS 失败: {e}")
-        return None
-
-
-async def synthesize_speech(text: str) -> Optional[bytes]:
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _synthesize_speech_blocking, text)
-
+if not DASHSCOPE_API_KEY or not WORKSPACE_ID:
+    log("⚠️ DASHSCOPE_API_KEY 或 WORKSPACE_ID 未设置!", "WARNING")
 
 # ── FastAPI ──────────────────────────────────────────────
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("🚀 同声传译服务器启动（阿里百炼 SDK 版）")
-    yield
-    logger.info("🛑 服务器关闭")
+app = FastAPI()
 
-app = FastAPI(lifespan=lifespan)
+# ── 房间管理 ──────────────────────────────────────────────
+class Room:
+    def __init__(self, room_id: str):
+        self.id = room_id
+        self.clients: Dict[str, WebSocket] = {}       # role -> websocket
+        self.langs: Dict[str, str] = {}               # role -> lang_code
+        self.upstreams: Dict[str, "UpstreamSession"] = {}
+        self._last_translation = ""
 
+    def other(self, role: str) -> str:
+        return "b" if role == "a" else "a"
 
-# ── 静态文件 ──────────────────────────────────────────────
-# 完全不用 StaticFiles，改用路由直接返回文件内容
+    def cleanup(self):
+        for up in self.upstreams.values():
+            asyncio.create_task(up.finish())
+        self.upstreams.clear()
 
-@app.get("/")
-async def get_index():
-    index_path = os.path.join("static", "index.html")
-    if os.path.exists(index_path):
-        with open(index_path, "r", encoding="utf-8") as f:
-            return HTMLResponse(content=f.read())
-    return HTMLResponse(content="<h1>index.html not found</h1>", status_code=404)
+# ── 安全发送 ──────────────────────────────────────────────
+async def safe_send(ws: Optional[WebSocket], payload: dict):
+    if ws is None:
+        return
+    try:
+        await ws.send_text(json.dumps(payload))
+    except Exception as e:
+        log(f"safe_send 失败: {e}", "WARNING")
 
+# ── UpstreamSession ───────────────────────────────────────
+class UpstreamSession:
+    """
+    一个方向的端对端翻译通道。
+    mic_role 说话 → 译文、译音都发回 mic_role 自己
+    """
+    def __init__(self, room: Room, mic_role: str):
+        self.room      = room
+        self.mic_role  = mic_role
+        self.peer_role = room.other(mic_role)
+        self.ws: Optional[websockets.WebSocketClientProtocol] = None
+        self._recv_task:      Optional[asyncio.Task] = None
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._connected  = False
+        self._is_active  = True
+        self._last_audio_time   = 0.0
+        self._last_src_text     = ""   # 原文去重
+        self._last_tgt_text     = ""   # 译文去重
+        self._session_id = f"up_{mic_role}_{uuid.uuid4().hex[:6]}"
+        # ✅ 句子计数器（用于配对原文和译文）
+        self._sentence_counter = 0
+        self._current_sentence_id = None   # 当前"正在等待译文"的句子 sid
+        self._pending_translation = None   # 暂存先到的译文（还没有对应原文）
 
-@app.get("/{filename}")
-async def get_static_file(filename: str):
-    """返回 static 目录下的其他文件（CSS、JS 等）"""
-    file_path = os.path.join("static", filename)
-    if os.path.exists(file_path) and os.path.isfile(file_path):
-        with open(file_path, "r", encoding="utf-8") as f:
-            content = f.read()
-        # 根据文件扩展名设置 MIME 类型
-        if filename.endswith(".css"):
-            return HTMLResponse(content=content, media_type="text/css")
-        elif filename.endswith(".js"):
-            return HTMLResponse(content=content, media_type="application/javascript")
-        elif filename.endswith(".html"):
-            return HTMLResponse(content=content)
-        else:
-            return HTMLResponse(content=content)
-    return HTMLResponse(content="File not found", status_code=404)
+    # ── 连接上游 ──────────────────────────────────────────
+    async def start(self) -> bool:
+        source_lang = self.room.langs.get(self.mic_role, "zh")
+        target_lang = self.room.langs.get(self.peer_role, "en")
+        log(f"启动上游 {self._session_id}: {source_lang} → {target_lang}")
 
+        if not DASHSCOPE_API_KEY or not WORKSPACE_ID:
+            log("DASHSCOPE_API_KEY / WORKSPACE_ID 未配置!", "ERROR")
+            return False
+
+        headers = {"Authorization": f"Bearer {DASHSCOPE_API_KEY}"}
+        url = (f"wss://{WORKSPACE_ID}.{REGION}.maas.aliyuncs.com"
+               f"/api-ws/v1/realtime?model={MODEL}")
+        try:
+            try:
+                self.ws = await websockets.connect(
+                    url, additional_headers=headers,
+                    max_size=None, ping_interval=20, ping_timeout=60)
+            except TypeError:
+                self.ws = await websockets.connect(
+                    url, extra_headers=headers,
+                    max_size=None, ping_interval=20, ping_timeout=60)
+            self._connected = True
+            log(f"✅ 上游连接成功 {self._session_id}")
+        except Exception as e:
+            log(f"❌ 上游连接失败 {self._session_id}: {e}", "ERROR")
+            return False
+
+        cfg = {
+            "event_id": f"evt_{uuid.uuid4().hex}",
+            "type": "session.update",
+            "session": {
+                "modalities": ["text", "audio"],
+                "input_audio_format":  "pcm",
+                "output_audio_format": "pcm",
+                "input_audio_transcription": {
+                    "model":    "qwen3-asr-flash-realtime",
+                    "language": source_lang,
+                },
+                "translation": {"language": target_lang},
+                "audio": {
+                    "input_sample_rate":  16000,
+                    "output_sample_rate": 24000,
+                },
+            },
+        }
+        try:
+            await self.ws.send(json.dumps(cfg))
+        except Exception as e:
+            log(f"❌ 会话配置发送失败 {self._session_id}: {e}", "ERROR")
+            return False
+
+        self._recv_task      = asyncio.create_task(self._recv_loop())
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        return True
+
+    # ── 心跳静音，防上游超时 ──────────────────────────────
+    async def _heartbeat_loop(self):
+        while self._connected and self._is_active:
+            await asyncio.sleep(2)
+            if not self._connected:
+                break
+            if time.time() - self._last_audio_time > 8:
+                try:
+                    await self.ws.send(json.dumps({
+                        "event_id": f"evt_{uuid.uuid4().hex}",
+                        "type":     "input_audio_buffer.append",
+                        "audio":    SILENCE_PCM,
+                    }))
+                except Exception:
+                    pass
+
+    # ── 发送音频帧 ────────────────────────────────────────
+    async def send_audio(self, pcm_b64: str):
+        if not self.ws or not self._connected or not self._is_active:
+            return
+        self._last_audio_time = time.time()
+        try:
+            await self.ws.send(json.dumps({
+                "event_id": f"evt_{uuid.uuid4().hex}",
+                "type":     "input_audio_buffer.append",
+                "audio":    pcm_b64,
+            }))
+        except Exception:
+            self._connected = False
+
+    # ── 关闭上游 ──────────────────────────────────────────
+    async def finish(self):
+        if not self.ws or not self._connected:
+            return
+        self._is_active = False
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+        try:
+            await self.ws.send(json.dumps({
+                "event_id": f"evt_{uuid.uuid4().hex}",
+                "type":     "session.finish",
+            }))
+            await asyncio.wait_for(self.ws.wait_closed(), timeout=5)
+        except (asyncio.TimeoutError, Exception):
+            pass
+        finally:
+            self._connected = False
+            if self._recv_task:
+                self._recv_task.cancel()
+
+    # ── 文本有效性检查 ────────────────────────────────────
+    def _is_valid(self, text: str) -> bool:
+        if not text or len(text.strip()) < 2:
+            return False
+        has_cjk = any('\u4e00' <= c <= '\u9fff' for c in text)
+        has_lat = any('a' <= c.lower() <= 'z' for c in text)
+        return has_cjk or has_lat
+
+    # ── 接收上游事件循环 ──────────────────────────────────
+    async def _recv_loop(self):
+        try:
+            async for raw in self.ws:
+                if not self._is_active:
+                    break
+                try:
+                    event = json.loads(raw)
+                    etype = event.get("type", "")
+
+                    mic_ws  = self.room.clients.get(self.mic_role)   # 说话者
+                    peer_ws = self.room.clients.get(self.peer_role)  # 对方
+
+                    # ── 原文流式（实时字幕给说话者看）────────
+                    if etype == "conversation.item.input_audio_transcription.text":
+                        text = event.get("text", "")
+                        await safe_send(mic_ws, {
+                            "kind": "self_original",
+                            "text": text,
+                            "final": False
+                        })
+
+                    # ── 原文最终 ─────────────────────────────
+                    elif etype == "conversation.item.input_audio_transcription.completed":
+                        text = event.get("transcript", "").strip()
+                        if not self._is_valid(text):
+                            log(f"⚠️ 过滤无效原文: {repr(text)}")
+                            continue
+                        if text == self._last_src_text:
+                            continue
+                        self._last_src_text = text
+
+                        # ✅ 生成句子ID
+                        self._sentence_counter += 1
+                        self._current_sentence_id = self._sentence_counter
+
+                        log(f"✅ [{self._session_id}] 原文 #{self._current_sentence_id}: {text}")
+                        await safe_send(mic_ws, {
+                            "kind": "self_original",
+                            "text": text,
+                            "final": True,
+                            "sid": self._current_sentence_id
+                        })
+
+                        # ✅ 如果有暂存的译文，立即发送并配对
+                        if self._pending_translation:
+                            log(f"📤 发送暂存译文 #{self._current_sentence_id}")
+                            await safe_send(mic_ws, {
+                                "kind": "self_translation",
+                                "text": self._pending_translation,
+                                "final": True,
+                                "sid": self._current_sentence_id
+                            })
+                            self._pending_translation = None
+                            # ✅ 这句已经配完对了，立刻释放 sid 槽位
+                            self._current_sentence_id = None
+
+                    # ── 译文流式（发给说话者自己）────────────
+                    elif etype in ("response.audio_transcript.text", "response.text.text"):
+                        text = event.get("text", "")
+                        await safe_send(mic_ws, {
+                            "kind": "self_translation",
+                            "text": text,
+                            "final": False
+                        })
+
+                    # ── 译文最终（发给说话者自己）────────────
+                    elif etype in ("response.audio_transcript.done", "response.text.done"):
+                        text = event.get("transcript") or event.get("text") or ""
+                        text = text.strip()
+                        if not self._is_valid(text):
+                            log(f"⚠️ 过滤无效译文: {repr(text)}")
+                            continue
+                        if text == self._last_tgt_text:
+                            continue
+                        if text == self.room._last_translation:
+                            log(f"⚠️ 全局重复译文: {repr(text)}")
+                            continue
+                        self._last_tgt_text = text
+                        self.room._last_translation = text
+
+                        # ✅ 如果还没有原文（sid 槽位空着），暂存译文
+                        if self._current_sentence_id is None:
+                            self._pending_translation = text
+                            log(f"📝 暂存译文（等待原文）: {text}")
+                            continue
+
+                        log(f"✅ [{self._session_id}] 译文 #{self._current_sentence_id}: {text}")
+                        await safe_send(mic_ws, {
+                            "kind": "self_translation",
+                            "text": text,
+                            "final": True,
+                            "sid": self._current_sentence_id
+                        })
+                        # ✅✅ 关键修复：用完立即清空 sid 槽位。
+                        # 若不清空，下一句的译文如果比它自己的原文
+                        # 更早到达，会被误判为"槽位已占用"从而错误地
+                        # 绑定到上一句已经配对完成的 sid 上，
+                        # 导致前端出现"原文栏显示英文/卡片配对错乱"。
+                        self._current_sentence_id = None
+
+                    # ── 译音PCM（发给说话者自己播放）─────────
+                    elif etype == "response.audio.delta":
+                        audio = event.get("delta", "")
+                        if audio:
+                            await safe_send(mic_ws, {
+                                "kind": "self_audio",
+                                "audio": audio
+                            })
+
+                    # ── 译音播放结束通知 ──────────────────────
+                    elif etype == "response.audio.done":
+                        await safe_send(mic_ws, {"kind": "audio_done"})
+                        log(f"🔔 [{self._session_id}] 译音完成，通知 {self.mic_role} 解锁")
+
+                except json.JSONDecodeError:
+                    pass
+
+        except websockets.exceptions.ConnectionClosed:
+            pass
+        finally:
+            self._connected = False
+
+# ── 房间存储 ──────────────────────────────────────────────
+rooms: Dict[str, Room] = {}
 
 # ── WebSocket 端点 ────────────────────────────────────────
-@app.websocket("/ws/{room_id}/{client_id}")
-async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str):
-    await websocket.accept()
-    logger.info(f"✅ 客户端 {client_id} 加入房间 {room_id}")
-
-    if room_id not in rooms:
-        rooms[room_id] = {"clients": {}, "languages": {}}
-    rooms[room_id]["clients"][client_id] = websocket
-    await broadcast_room_status(room_id)
-
-    loop = asyncio.get_running_loop()
-    callback = StreamingCallback(client_id, loop, room_id)
-
-    try:
-        recognition = Recognition(
-            model=ASR_MODEL,
-            format="pcm",
-            sample_rate=16000,
-            callback=callback,
-            enable_intermediate_result=True,
-        )
-        recognition.start()
-        logger.info(f"✅ ASR 会话已创建: {client_id}")
-        await websocket.send_text(json.dumps({"type": "asr_ready", "msg": "语音识别已就绪"}))
-    except Exception as e:
-        logger.error(f"ASR 启动失败: {e}")
-        await websocket.send_text(json.dumps({"type": "asr_error", "msg": f"ASR 启动失败: {e}"}))
+@app.websocket("/ws/{room_id}/{role}")
+async def ws_endpoint(websocket: WebSocket, room_id: str, role: str):
+    if role not in ("a", "b"):
         await websocket.close()
         return
 
+    await websocket.accept()
+    room = rooms.setdefault(room_id, Room(room_id))
+    room.clients[role] = websocket
+
     try:
+        # ── 握手：等待 init 消息 ──────────────────────────
+        raw = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
+        init = json.loads(raw)
+        if init.get("type") != "init":
+            await websocket.close(code=4002)
+            return
+
+        room.langs[role] = init.get("lang", "zh")
+        peer_lang = init.get("target_lang", "en")
+        if room.other(role) not in room.langs:
+            room.langs[room.other(role)] = peer_lang
+
+        log(f"角色 {role} 连入房间 {room_id}, 语言={room.langs[role]}")
+
+        # ── 启动本角色的上游通道 ─────────────────────────
+        key = f"{role}2{room.other(role)}"
+        up  = UpstreamSession(room, mic_role=role)
+        ok  = await up.start()
+        if not ok:
+            await websocket.close(code=4005)
+            return
+        room.upstreams[key] = up
+
+        await safe_send(websocket, {
+            "kind": "status", "text": "✅ 已连接", "paired": True
+        })
+
+        # ── 主循环：接收前端音频帧和控制消息 ──────────────
         while True:
-            data = await websocket.receive_text()
-            message = json.loads(data)
-            msg_type = message.get("type")
+            try:
+                msg_raw = await asyncio.wait_for(
+                    websocket.receive_text(), timeout=120.0)
+                msg = json.loads(msg_raw)
 
-            if msg_type == "set_language":
-                target_lang = message.get("target_lang", "en")
-                rooms[room_id]["languages"][client_id] = target_lang
-                logger.info(f"   {client_id} 目标语言: {target_lang}")
-                await broadcast_room_status(room_id)
+                if msg.get("type") == "audio":
+                    up_session = room.upstreams.get(key)
+                    if up_session:
+                        await up_session.send_audio(msg["data"])
 
-            elif msg_type == "audio":
-                audio_b64 = message.get("audio", "")
-                if not audio_b64:
-                    continue
-                pcm_bytes = base64.b64decode(audio_b64)
+                # ── VAD 静音断句 ──────────────────────────
+                elif msg.get("type") == "vad_stop":
+                    up_session = room.upstreams.get(key)
+                    if up_session and up_session.ws and up_session._connected:
+                        try:
+                            await up_session.ws.send(json.dumps({
+                                "event_id": f"evt_{uuid.uuid4().hex}",
+                                "type": "input_audio_buffer.commit",
+                            }))
+                            log(f"📢 VAD 静音断句: {role}")
+                        except Exception as e:
+                            log(f"VAD断句失败: {e}", "WARNING")
 
-                if callback.is_broken:
-                    logger.warning(f"ASR 会话已断开，尝试重建: {client_id}")
-                    try:
-                        recognition = Recognition(
-                            model=ASR_MODEL,
-                            format="pcm",
-                            sample_rate=16000,
-                            callback=callback,
-                            enable_intermediate_result=True,
-                        )
-                        recognition.start()
-                        callback.is_broken = False
-                        logger.info(f"✅ ASR 会话已重建: {client_id}")
-                    except Exception as e:
-                        logger.error(f"ASR 重建失败: {e}")
-                        continue
+            except asyncio.TimeoutError:
+                pass
+            except WebSocketDisconnect:
+                break
+            except Exception as e:
+                log(f"主循环异常 {role}: {e}", "WARNING")
+                break
 
-                try:
-                    recognition.send_audio_frame(pcm_bytes)
-                except Exception as e:
-                    logger.error(f"发送音频失败: {e}")
-                    callback.is_broken = True
-
-    except WebSocketDisconnect:
-        logger.info(f"❌ 客户端 {client_id} 断开连接")
     finally:
+        room.clients.pop(role, None)
+        log(f"角色 {role} 离开房间 {room_id}")
+        if not room.clients:
+            room.cleanup()
+            rooms.pop(room_id, None)
+            log(f"房间 {room_id} 已清理")
         try:
-            recognition.stop()
-        except Exception:
-            pass
-        if room_id in rooms:
-            rooms[room_id]["clients"].pop(client_id, None)
-            rooms[room_id]["languages"].pop(client_id, None)
-            if not rooms[room_id]["clients"]:
-                await asyncio.sleep(5)
-                if room_id in rooms and not rooms[room_id]["clients"]:
-                    del rooms[room_id]
-            else:
-                await broadcast_room_status(room_id)
-
-
-# ── 处理识别结果 ──────────────────────────────────────────
-async def handle_asr_result(client_id: str, text: str, room_id: str, is_end: bool):
-    if room_id not in rooms:
-        return
-    if client_id not in rooms[room_id]["clients"]:
-        return
-
-    speaker_ws = rooms[room_id]["clients"][client_id]
-    try:
-        await speaker_ws.send_text(json.dumps({
-            "type": "asr_result",
-            "text": text,
-            "is_end": is_end
-        }))
-    except Exception as e:
-        logger.error(f"发送识别结果失败: {e}")
-
-    if not is_end:
-        return
-
-    target_langs = {
-        cid: lang for cid, lang in rooms[room_id]["languages"].items()
-        if cid != client_id
-    }
-    if target_langs:
-        await asyncio.gather(*[
-            translate_and_synthesize(text, target_lang, target_cid, room_id, client_id)
-            for target_cid, target_lang in target_langs.items()
-        ])
-
-
-# ── 翻译 + TTS ──────────────────────────────────────────
-async def translate_and_synthesize(text: str, target_lang: str,
-                                   target_client_id: str, room_id: str,
-                                   speaker_id: str):
-    try:
-        translated = await translate_text(text, target_lang)
-        audio_bytes = await synthesize_speech(translated)
-        audio_b64 = base64.b64encode(audio_bytes).decode('utf-8') if audio_bytes else ""
-
-        if room_id in rooms and target_client_id in rooms[room_id]["clients"]:
-            target_ws = rooms[room_id]["clients"][target_client_id]
-            await target_ws.send_text(json.dumps({
-                "type": "translation",
-                "from": speaker_id,
-                "text": translated,
-                "audio": audio_b64,
-                "lang": target_lang
-            }))
-    except Exception as e:
-        logger.error(f"翻译合成失败: {e}")
-
-
-# ── 广播房间状态 ──────────────────────────────────────────
-async def broadcast_room_status(room_id: str):
-    if room_id not in rooms:
-        return
-    clients = rooms[room_id]["clients"]
-    languages = rooms[room_id]["languages"]
-    status = {
-        "type": "room_status",
-        "clients": [
-            {"id": cid, "lang": languages.get(cid, "未设置")}
-            for cid in clients.keys()
-        ]
-    }
-    for ws in clients.values():
-        try:
-            await ws.send_text(json.dumps(status))
+            await websocket.close()
         except Exception:
             pass
 
+# ── 静态前端 ──────────────────────────────────────────────
+try:
+    app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
+except Exception as e:
+    log(f"⚠️ 前端静态文件挂载失败: {e}", "WARNING")
 
-# ── 启动入口 ─────────────────────────────────────────────
+# ── 启动入口（支持环境变量 PORT）─────────────────────────
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 7860))
