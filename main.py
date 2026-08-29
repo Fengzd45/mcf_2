@@ -29,7 +29,7 @@ def log(msg: str, level: str = "INFO"):
 
 # ── 环境变量 ──────────────────────────────────────────────
 DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
-WORKSPACE_ID = os.environ.get("DASHSCOPE_WORKSPACE_ID", "")
+WORKSPACE_ID = os.environ.get("WORKSPACE_ID", "")
 REGION = os.environ.get("REGION", "cn-beijing")
 MODEL = os.environ.get("MODEL", "qwen3-translation-realtime-v1")
 SILENCE_PCM = base64.b64encode(b"\x00" * 3200).decode()
@@ -165,6 +165,7 @@ class UpstreamSession:
     # ── 发送音频帧 ────────────────────────────────────────
     async def send_audio(self, pcm_b64: str):
         if not self.ws or not self._connected or not self._is_active:
+            log(f"⚠️ 无法发送音频：ws={self.ws is not None}, connected={self._connected}, active={self._is_active}", "WARNING")
             return
         self._last_audio_time = time.time()
         try:
@@ -173,7 +174,9 @@ class UpstreamSession:
                 "type":     "input_audio_buffer.append",
                 "audio":    pcm_b64,
             }))
-        except Exception:
+            log(f"📤 已转发音频帧到上游 {self._session_id}，长度={len(pcm_b64)}")
+        except Exception as e:
+            log(f"❌ 发送音频到上游失败: {e}", "ERROR")
             self._connected = False
 
     # ── 关闭上游 ──────────────────────────────────────────
@@ -213,6 +216,7 @@ class UpstreamSession:
                 try:
                     event = json.loads(raw)
                     etype = event.get("type", "")
+                    log(f"📩 上游事件 {self._session_id}: {etype}")
 
                     mic_ws  = self.room.clients.get(self.mic_role)   # 说话者
                     peer_ws = self.room.clients.get(self.peer_role)  # 对方
@@ -220,6 +224,7 @@ class UpstreamSession:
                     # ── 原文流式（实时字幕给说话者看）────────
                     if etype == "conversation.item.input_audio_transcription.text":
                         text = event.get("text", "")
+                        log(f"📝 流式原文: {text}")
                         await safe_send(mic_ws, {
                             "kind": "self_original",
                             "text": text,
@@ -229,10 +234,12 @@ class UpstreamSession:
                     # ── 原文最终 ─────────────────────────────
                     elif etype == "conversation.item.input_audio_transcription.completed":
                         text = event.get("transcript", "").strip()
+                        log(f"✅ 最终原文: {text}")
                         if not self._is_valid(text):
                             log(f"⚠️ 过滤无效原文: {repr(text)}")
                             continue
                         if text == self._last_src_text:
+                            log(f"⚠️ 重复原文，跳过")
                             continue
                         self._last_src_text = text
 
@@ -240,7 +247,7 @@ class UpstreamSession:
                         self._sentence_counter += 1
                         self._current_sentence_id = self._sentence_counter
 
-                        log(f"✅ [{self._session_id}] 原文 #{self._current_sentence_id}: {text}")
+                        log(f"📨 发送原文 #{self._current_sentence_id} 给前端")
                         await safe_send(mic_ws, {
                             "kind": "self_original",
                             "text": text,
@@ -258,12 +265,12 @@ class UpstreamSession:
                                 "sid": self._current_sentence_id
                             })
                             self._pending_translation = None
-                            # ✅ 这句已经配完对了，立刻释放 sid 槽位
                             self._current_sentence_id = None
 
                     # ── 译文流式（发给说话者自己）────────────
                     elif etype in ("response.audio_transcript.text", "response.text.text"):
                         text = event.get("text", "")
+                        log(f"🌐 流式译文: {text}")
                         await safe_send(mic_ws, {
                             "kind": "self_translation",
                             "text": text,
@@ -274,10 +281,12 @@ class UpstreamSession:
                     elif etype in ("response.audio_transcript.done", "response.text.done"):
                         text = event.get("transcript") or event.get("text") or ""
                         text = text.strip()
+                        log(f"✅ 最终译文: {text}")
                         if not self._is_valid(text):
                             log(f"⚠️ 过滤无效译文: {repr(text)}")
                             continue
                         if text == self._last_tgt_text:
+                            log(f"⚠️ 重复译文，跳过")
                             continue
                         if text == self.room._last_translation:
                             log(f"⚠️ 全局重复译文: {repr(text)}")
@@ -291,24 +300,20 @@ class UpstreamSession:
                             log(f"📝 暂存译文（等待原文）: {text}")
                             continue
 
-                        log(f"✅ [{self._session_id}] 译文 #{self._current_sentence_id}: {text}")
+                        log(f"📨 发送译文 #{self._current_sentence_id} 给前端")
                         await safe_send(mic_ws, {
                             "kind": "self_translation",
                             "text": text,
                             "final": True,
                             "sid": self._current_sentence_id
                         })
-                        # ✅✅ 关键修复：用完立即清空 sid 槽位。
-                        # 若不清空，下一句的译文如果比它自己的原文
-                        # 更早到达，会被误判为"槽位已占用"从而错误地
-                        # 绑定到上一句已经配对完成的 sid 上，
-                        # 导致前端出现"原文栏显示英文/卡片配对错乱"。
                         self._current_sentence_id = None
 
                     # ── 译音PCM（发给说话者自己播放）─────────
                     elif etype == "response.audio.delta":
                         audio = event.get("delta", "")
                         if audio:
+                            log(f"🔊 收到译音分片，长度={len(audio)}")
                             await safe_send(mic_ws, {
                                 "kind": "self_audio",
                                 "audio": audio
@@ -317,13 +322,13 @@ class UpstreamSession:
                     # ── 译音播放结束通知 ──────────────────────
                     elif etype == "response.audio.done":
                         await safe_send(mic_ws, {"kind": "audio_done"})
-                        log(f"🔔 [{self._session_id}] 译音完成，通知 {self.mic_role} 解锁")
+                        log(f"🔔 译音完成，通知 {self.mic_role} 解锁")
 
-                except json.JSONDecodeError:
-                    pass
+                except json.JSONDecodeError as e:
+                    log(f"JSON 解析失败: {e}", "WARNING")
 
-        except websockets.exceptions.ConnectionClosed:
-            pass
+        except websockets.exceptions.ConnectionClosed as e:
+            log(f"上游连接关闭 {self._session_id}: {e}")
         finally:
             self._connected = False
 
@@ -338,6 +343,8 @@ async def ws_endpoint(websocket: WebSocket, room_id: str, role: str):
         return
 
     await websocket.accept()
+    log(f"🔌 WebSocket 连接: room={room_id}, role={role}")
+
     room = rooms.setdefault(room_id, Room(room_id))
     room.clients[role] = websocket
 
@@ -377,12 +384,16 @@ async def ws_endpoint(websocket: WebSocket, room_id: str, role: str):
                 msg = json.loads(msg_raw)
 
                 if msg.get("type") == "audio":
+                    log(f"🎤 收到前端音频帧，长度={len(msg['data'])}")
                     up_session = room.upstreams.get(key)
                     if up_session:
                         await up_session.send_audio(msg["data"])
+                    else:
+                        log(f"⚠️ 未找到上游通道 {key}")
 
                 # ── VAD 静音断句 ──────────────────────────
                 elif msg.get("type") == "vad_stop":
+                    log(f"📢 VAD 静音断句: {role}")
                     up_session = room.upstreams.get(key)
                     if up_session and up_session.ws and up_session._connected:
                         try:
@@ -390,13 +401,15 @@ async def ws_endpoint(websocket: WebSocket, room_id: str, role: str):
                                 "event_id": f"evt_{uuid.uuid4().hex}",
                                 "type": "input_audio_buffer.commit",
                             }))
-                            log(f"📢 VAD 静音断句: {role}")
+                            log(f"✅ VAD 提交成功: {role}")
                         except Exception as e:
                             log(f"VAD断句失败: {e}", "WARNING")
 
             except asyncio.TimeoutError:
+                log(f"主循环超时 {role}")
                 pass
             except WebSocketDisconnect:
+                log(f"WebSocket 断开 {role}")
                 break
             except Exception as e:
                 log(f"主循环异常 {role}: {e}", "WARNING")
@@ -417,6 +430,7 @@ async def ws_endpoint(websocket: WebSocket, room_id: str, role: str):
 # ── 静态前端 ──────────────────────────────────────────────
 try:
     app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
+    log("✅ 静态文件挂载成功")
 except Exception as e:
     log(f"⚠️ 前端静态文件挂载失败: {e}", "WARNING")
 
