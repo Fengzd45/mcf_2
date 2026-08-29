@@ -445,8 +445,11 @@ let readyA = false, readyB = false;
 
 const SILENCE_THRESHOLD = 0.005;
 const SILENCE_FRAMES_MAX = 30;
+const MAX_RECORDING_MS = 15000;   // 兜底：即使检测不到静音，说话超过15秒也强制断句
 let silenceFrames = 0;
 let isSpeaking = false;
+let recordingStartTime = 0;
+let debugMaxRms = 0;   // 调试用：本次录音期间观察到的最大音量
 let sampleRate = 16000;
 
 let playCtx = null;
@@ -564,6 +567,7 @@ async function ensureMic() {
       let sum = 0;
       for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
       const rms = Math.sqrt(sum / data.length);
+      if (rms > debugMaxRms) debugMaxRms = rms;
 
       if (rms > SILENCE_THRESHOLD) {
         silenceFrames = 0;
@@ -586,6 +590,18 @@ async function ensureMic() {
           }
         }
       }
+
+      // ✅ 兜底：录音时间过长（可能是音量检测不到导致的假"说话中"）强制断句
+      if (recordingRole && recordingStartTime &&
+          (Date.now() - recordingStartTime) > MAX_RECORDING_MS) {
+        console.warn(`[VAD兜底] 超过 ${MAX_RECORDING_MS}ms 未静音断句，本段最大RMS=${debugMaxRms.toFixed(5)}（阈值=${SILENCE_THRESHOLD}），强制断句`);
+        isSpeaking = false;
+        silenceFrames = 0;
+        recordingStartTime = Date.now();
+        debugMaxRms = 0;
+        ws.send(JSON.stringify({ type: 'vad_stop' }));
+        statusBar.textContent = `⏳ 超时强制断句...`;
+      }
     };
     return true;
   } catch (e) {
@@ -607,6 +623,8 @@ async function startRecording(role) {
   recordingRole = role;
   isSpeaking = false;
   silenceFrames = 0;
+  recordingStartTime = Date.now();
+  debugMaxRms = 0;
   refreshMicUI();
   statusBar.textContent = `🎤 ${role.toUpperCase()} 说话中...`;
 }
@@ -719,8 +737,8 @@ function unlockAfterPlay() {
 ══════════════════════════════════════════════════════════ */
 function connectWs(role, lang, targetLang) {
   return new Promise((resolve, reject) => {
-    // ✅ 用当前页面域名（Render 上就是你的服务域名），不再硬编码
-    const host = location.host;
+    // ✅ 关键修复：硬编码域名 + 强制 wss
+    const host = 'mcf-2.onrender.com';
     const wsUrl = `wss://${host}/ws/${roomId}/${role}`;
     
     console.log(`🔗 连接 ${role}: ${wsUrl}`);
