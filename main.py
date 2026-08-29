@@ -7,7 +7,6 @@ import logging
 import requests
 from typing import Dict, Optional
 from fastapi import FastAPI, WebSocketDisconnect, WebSocket
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 from contextlib import asynccontextmanager
 
@@ -26,10 +25,10 @@ if not DASHSCOPE_API_KEY:
     logger.warning("⚠️ 环境变量 DASHSCOPE_API_KEY 未设置！")
 
 # ── 模型配置 ──────────────────────────────────────────────
-ASR_MODEL = "fun-asr-realtime"  # 语音识别
+ASR_MODEL = "fun-asr-realtime"
 TRANSLATE_URL = "https://dashscope.aliyuncs.com/api/v1/services/machine-translation/translation"
-TRANSLATE_MODEL = "qwen-mt-turbo"  # 翻译
-TTS_MODEL = "cosyvoice-v2"  # 语音合成
+TRANSLATE_MODEL = "qwen-mt-turbo"
+TTS_MODEL = "cosyvoice-v2"
 TTS_VOICE = "longxiaochun_v2"
 
 # ── 语言映射 ──────────────────────────────────────────────
@@ -188,11 +187,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# ── 静态文件 ──────────────────────────────────────────────
-# 挂载 static 目录到 /static 路径
-app.mount("/static", StaticFiles(directory="static", html=True), name="static")
 
-# 根路径返回 index.html（不拦截 WebSocket）
+# ── 静态文件 ──────────────────────────────────────────────
+# 完全不用 StaticFiles，改用路由直接返回文件内容
+
 @app.get("/")
 async def get_index():
     index_path = os.path.join("static", "index.html")
@@ -200,6 +198,25 @@ async def get_index():
         with open(index_path, "r", encoding="utf-8") as f:
             return HTMLResponse(content=f.read())
     return HTMLResponse(content="<h1>index.html not found</h1>", status_code=404)
+
+
+@app.get("/{filename}")
+async def get_static_file(filename: str):
+    """返回 static 目录下的其他文件（CSS、JS 等）"""
+    file_path = os.path.join("static", filename)
+    if os.path.exists(file_path) and os.path.isfile(file_path):
+        with open(file_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        # 根据文件扩展名设置 MIME 类型
+        if filename.endswith(".css"):
+            return HTMLResponse(content=content, media_type="text/css")
+        elif filename.endswith(".js"):
+            return HTMLResponse(content=content, media_type="application/javascript")
+        elif filename.endswith(".html"):
+            return HTMLResponse(content=content)
+        else:
+            return HTMLResponse(content=content)
+    return HTMLResponse(content="File not found", status_code=404)
 
 
 # ── WebSocket 端点 ────────────────────────────────────────
@@ -299,7 +316,6 @@ async def handle_asr_result(client_id: str, text: str, room_id: str, is_end: boo
     if client_id not in rooms[room_id]["clients"]:
         return
 
-    # 实时字幕（发给说话者自己）
     speaker_ws = rooms[room_id]["clients"][client_id]
     try:
         await speaker_ws.send_text(json.dumps({
@@ -310,7 +326,6 @@ async def handle_asr_result(client_id: str, text: str, room_id: str, is_end: boo
     except Exception as e:
         logger.error(f"发送识别结果失败: {e}")
 
-    # 整句结束后翻译发给其他人
     if not is_end:
         return
 
@@ -367,7 +382,7 @@ async def broadcast_room_status(room_id: str):
             pass
 
 
-# ── 启动入口（兼容 Render 的 PORT 环境变量）─────────────
+# ── 启动入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 7860))
