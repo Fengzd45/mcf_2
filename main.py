@@ -29,36 +29,33 @@ def log(msg: str, level: str = "INFO"):
 
 # ── 环境变量 ──────────────────────────────────────────────
 DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
-WORKSPACE_ID      = os.environ.get("DASHSCOPE_WORKSPACE_ID", "")
-REGION            = os.environ.get("BAILIAN_REGION", "cn-beijing")
-MODEL             = os.environ.get("LIVETRANSLATE_MODEL", "qwen3.5-livetranslate-flash-realtime")
+WORKSPACE_ID = os.environ.get("WORKSPACE_ID", "")
+REGION = os.environ.get("REGION", "cn-beijing")
+MODEL = os.environ.get("MODEL", "qwen3-translation-realtime-v1")
+SILENCE_PCM = base64.b64encode(b"\x00" * 3200).decode()
 
-# 静音PCM包，防止上游会话超时（百炼不会将其识别为语音）
-SILENCE_PCM = base64.b64encode(bytes(16000 // 2)).decode("utf-8")
+if not DASHSCOPE_API_KEY or not WORKSPACE_ID:
+    log("⚠️ DASHSCOPE_API_KEY 或 WORKSPACE_ID 未设置!", "WARNING")
 
+# ── FastAPI ──────────────────────────────────────────────
 app = FastAPI()
 
-# ── Room ─────────────────────────────────────────────────
+# ── 房间管理 ──────────────────────────────────────────────
 class Room:
     def __init__(self, room_id: str):
-        self.room_id   = room_id
-        self.clients:   Dict[str, WebSocket] = {}   # role -> ws
-        self.langs:     Dict[str, str]       = {}   # role -> lang_code
-        self.upstreams: Dict[str, "UpstreamSession"] = {}  # "a2b" / "b2a"
-        self.created_at = time.time()
-        self._last_translation: str = ""            # 全局去重
+        self.id = room_id
+        self.clients: Dict[str, WebSocket] = {}       # role -> websocket
+        self.langs: Dict[str, str] = {}               # role -> lang_code
+        self.upstreams: Dict[str, "UpstreamSession"] = {}
+        self._last_translation = ""
 
     def other(self, role: str) -> str:
         return "b" if role == "a" else "a"
 
     def cleanup(self):
-        for up in list(self.upstreams.values()):
+        for up in self.upstreams.values():
             asyncio.create_task(up.finish())
         self.upstreams.clear()
-        self.clients.clear()
-        self.langs.clear()
-
-rooms: Dict[str, Room] = {}
 
 # ── 安全发送 ──────────────────────────────────────────────
 async def safe_send(ws: Optional[WebSocket], payload: dict):
@@ -329,6 +326,9 @@ class UpstreamSession:
             pass
         finally:
             self._connected = False
+
+# ── 房间存储 ──────────────────────────────────────────────
+rooms: Dict[str, Room] = {}
 
 # ── WebSocket 端点 ────────────────────────────────────────
 @app.websocket("/ws/{room_id}/{role}")
