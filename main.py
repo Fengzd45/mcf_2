@@ -173,8 +173,9 @@ class UpstreamSession:
                 "type":     "input_audio_buffer.append",
                 "audio":    pcm_b64,
             }))
-        except Exception:
+        except Exception as e:
             self._connected = False
+            log(f"❌ 音频发送失败，上游标记断开 {self._session_id}: {e}", "ERROR")
 
     # ── 关闭上游 ──────────────────────────────────────────
     async def finish(self):
@@ -322,10 +323,13 @@ class UpstreamSession:
                 except json.JSONDecodeError:
                     pass
 
-        except websockets.exceptions.ConnectionClosed:
-            pass
+        except websockets.exceptions.ConnectionClosed as e:
+            log(f"⚠️ 上游连接已断开 {self._session_id}: code={e.code} reason={e.reason}", "WARNING")
+        except Exception as e:
+            log(f"❌ 上游接收循环异常 {self._session_id}: {type(e).__name__}: {e}", "ERROR")
         finally:
             self._connected = False
+            log(f"🔌 上游标记为已断开 {self._session_id} (_connected=False)", "WARNING")
 
 # ── 房间存储 ──────────────────────────────────────────────
 rooms: Dict[str, Room] = {}
@@ -393,6 +397,12 @@ async def ws_endpoint(websocket: WebSocket, room_id: str, role: str):
                             log(f"📢 VAD 静音断句: {role}")
                         except Exception as e:
                             log(f"VAD断句失败: {e}", "WARNING")
+                    else:
+                        # ✅ 之前这里是完全静默跳过，导致排查时看起来"消息没送达"
+                        log(f"⚠️ 收到 {role} 的 vad_stop，但上游会话不可用 "
+                            f"(存在={bool(up_session)}, "
+                            f"ws存在={bool(up_session and up_session.ws)}, "
+                            f"connected={up_session._connected if up_session else 'N/A'})", "WARNING")
 
             except asyncio.TimeoutError:
                 pass
