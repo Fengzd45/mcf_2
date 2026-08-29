@@ -188,22 +188,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-
-# ── 静态文件（兼容你的 frontend 目录）─────────────────────
-# 如果你的前端文件在 frontend/ 目录下
-if os.path.exists("frontend"):
-    app.mount("/static", StaticFiles(directory="frontend"), name="static")
-    # 同时也挂载根目录，指向 frontend
-    app.mount("/", StaticFiles(directory="frontend", html=True), name="root")
-else:
-    # 兼容魔搭项目的 static/ 目录
-    app.mount("/static", StaticFiles(directory="static"), name="static")
-    @app.get("/")
-    async def get_index():
-        return FileResponse("static/index.html")
+# ── 静态文件 ──────────────────────────────────────────────
+# 挂载 static 目录到根路径（你已重命名 frontend → static）
+app.mount("/", StaticFiles(directory="static", html=True), name="root")
 
 
-# ── WebSocket 端点（适配你的 URL 格式）────────────────────
+# ── WebSocket 端点 ────────────────────────────────────────
 @app.websocket("/ws/{room_id}/{client_id}")
 async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str):
     await websocket.accept()
