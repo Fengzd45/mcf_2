@@ -613,17 +613,6 @@ async function startRecording(role) {
 
 /* ══════════════════════════════════════════════════════════
    音频播放（译音）
-   ────────────────────────────────────────────────────────
-   ⚠️ 修复说明：旧版用「1500ms 静音去抖」来决定何时开始播放
-   （enqueueAudio → setTimeout(flushQueue, 1500)），但 audio_done
-   之后的解锁定时器只等 500ms（onAudioDone 里 remaining 常年是 0，
-   因为 playCursor 还没被 flushQueue 更新过）。
-   500ms < 1500ms，于是几乎每次都是：解锁定时器先跑完，
-   unlockAfterPlay() 把 playQueue 清空 —— 然后 1500ms 的
-   flushQueue 才姗姗来迟，此时队列已经是空的，直接 return，
-   声音从未真正播放。这就是手机上（其实所有设备上）译音
-   播不出来的根本原因。
-   修复思路：音频分片一到就立即调度播放，不再等待去抖计时器。
 ══════════════════════════════════════════════════════════ */
 function enqueueAudio(b64) {
   if (!b64) return;
@@ -657,8 +646,6 @@ function enqueueAudio(b64) {
 
   playQueue.push(buf);
 
-  // ✅ 第一块音频到达即宣布"开始播放"状态并锁麦，
-  // 不再等待任何去抖计时器
   if (!audioPlaying) {
     audioPlaying = true;
     if (recordingRole) {
@@ -674,9 +661,6 @@ function enqueueAudio(b64) {
   drainQueue();
 }
 
-// ✅ 把队列里所有已到达的分片一次性排入播放时间轴，
-// 依靠 playCursor 累加保证分片之间严丝合缝、没有空档，
-// 不再依赖 onended 回调递归触发（手机后台/节流时回调可能被延迟）。
 function drainQueue() {
   while (playQueue.length > 0) {
     const buf = playQueue.shift();
@@ -715,25 +699,50 @@ function unlockAfterPlay() {
 }
 
 /* ══════════════════════════════════════════════════════════
-   WebSocket
+   WebSocket 连接（🔧 已修改：强制 WSS + 增加错误日志）
 ══════════════════════════════════════════════════════════ */
 function connectWs(role, lang, targetLang) {
   return new Promise((resolve, reject) => {
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(`${proto}://${location.host}/ws/${roomId}/${role}`);
+    // 🔧 修改1：强制使用 wss 协议（无论页面是 http 还是 https）
+    // 🔧 修改2：使用硬编码域名，避免 location.host 在部分浏览器中解析异常
+    const host = 'mcf-2.onrender.com';
+    const wsUrl = `wss://${host}/ws/${roomId}/${role}`;
+    
+    console.log(`🔗 正在连接 ${role}: ${wsUrl}`);
+    statusBar.textContent = `⏳ 连接 ${role.toUpperCase()} 通道...`;
+
+    const ws = new WebSocket(wsUrl);
     ws._role = role;
-    const timer = setTimeout(() => { ws.close(); reject(new Error(`${role} 连接超时`)); }, 30000);
+    
+    // 连接超时 30 秒
+    const timer = setTimeout(() => {
+      ws.close();
+      reject(new Error(`${role} 连接超时 (30s)`));
+    }, 30000);
 
     ws.onopen = () => {
+      clearTimeout(timer);
+      console.log(`✅ ${role} WebSocket 已打开`);
       ws.send(JSON.stringify({ type: 'init', lang: lang, target_lang: targetLang }));
     };
-    ws.onerror = (e) => { clearTimeout(timer); reject(e); };
-    ws.onclose = () => {
+
+    ws.onerror = (e) => {
       clearTimeout(timer);
+      console.error(`❌ ${role} WebSocket 错误:`, e);
+      reject(new Error(`${role} 连接失败: ${e.message || '未知错误'}`));
+    };
+
+    ws.onclose = (e) => {
+      clearTimeout(timer);
+      console.log(`🔌 ${role} WebSocket 已关闭, code=${e.code}, reason=${e.reason}`);
       if (role === 'a') readyA = false;
       else readyB = false;
       refreshMicUI();
+      if (e.code !== 1000) {
+        statusBar.textContent = `⚠️ ${role.toUpperCase()} 连接断开 (${e.code})`;
+      }
     };
+
     ws.onmessage = (ev) => {
       try {
         const msg = JSON.parse(ev.data);
@@ -742,7 +751,9 @@ function connectWs(role, lang, targetLang) {
           resolve(ws);
         }
         handleMessage(ws._role, msg);
-      } catch (e) { console.error('消息解析失败:', e); }
+      } catch (e) {
+        console.error('消息解析失败:', e);
+      }
     };
   });
 }
@@ -763,7 +774,6 @@ function handleMessage(role, msg) {
     case 'self_original': {
       if (!msg.text || msg.text.length < 1) break;
 
-      // 流式原文：只更新，不创建
       if (!msg.final) {
         let item = role === 'a' ? currentItemA : currentItemB;
         if (item) {
@@ -774,13 +784,10 @@ function handleMessage(role, msg) {
         break;
       }
 
-      // 最终原文
       const sid = msg.sid || Date.now() + '_' + Math.random();
 
-      // 检查是否有译文先到（在 pendingItems 中）
       let entry = pendingItems[sid];
       if (entry) {
-        // 译文已先到，更新原文
         const origDiv = entry.item.querySelector('.msg-original');
         origDiv.textContent = msg.text;
         entry.original = msg.text;
@@ -792,7 +799,6 @@ function handleMessage(role, msg) {
         break;
       }
 
-      // 创建新卡片
       const item = createNewItem(role);
       const origDiv = item.querySelector('.msg-original');
       origDiv.textContent = msg.text;
@@ -800,7 +806,6 @@ function handleMessage(role, msg) {
       transDiv.textContent = '⏳ 翻译中...';
       transDiv.classList.add('pending');
 
-      // 存入待配对队列
       pendingItems[sid] = {
         item: item,
         role: role,
@@ -820,7 +825,6 @@ function handleMessage(role, msg) {
     case 'self_translation': {
       if (!msg.text || msg.text.length < 1) break;
 
-      // 流式译文：只更新，不创建
       if (!msg.final) {
         let item = role === 'a' ? currentItemA : currentItemB;
         if (item) {
@@ -832,13 +836,10 @@ function handleMessage(role, msg) {
         break;
       }
 
-      // 最终译文
       const sid = msg.sid || Date.now() + '_' + Math.random();
 
-      // 查找对应的原文卡片
       let entry = pendingItems[sid];
       if (entry) {
-        // 原文已到，更新译文
         const transDiv = entry.item.querySelector('.msg-translation');
         transDiv.textContent = msg.text;
         transDiv.classList.remove('pending');
@@ -852,7 +853,6 @@ function handleMessage(role, msg) {
         break;
       }
 
-      // 译文先到：创建卡片，原文待填充
       const item = createNewItem(role);
       const origDiv = item.querySelector('.msg-original');
       origDiv.textContent = '…';
@@ -949,8 +949,6 @@ function pcmToBase64(f32) {
 startBtn.onclick = async () => {
   if (startBtn.disabled) return;
 
-  // ✅ 在“开始通话”这个用户手势里就先激活播放用的 AudioContext，
-  // 尽早满足手机浏览器的手势要求，减少后续第一次播放失败的概率
   ensurePlayCtxFromGesture();
 
   const lang1 = lang1Sel.value;
@@ -975,105 +973,3 @@ startBtn.onclick = async () => {
 
   document.getElementById('startScreen').classList.remove('active');
   document.getElementById('callScreen').classList.add('active');
-  statusBar.textContent = '⏳ 正在连接...';
-  refreshMicUI();
-
-  try {
-    const [a, b] = await Promise.all([
-      connectWs('a', lang1, lang2),
-      connectWs('b', lang2, lang1)
-    ]);
-    wsA = a;
-    wsB = b;
-    readyA = true;
-    readyB = true;
-    statusBar.textContent = '✅ 已连接，点击麦克风开始说话（静音自动断句）';
-    refreshMicUI();
-    startBtn.disabled = false;
-  } catch (e) {
-    alert('连接失败: ' + e.message);
-    startBtn.disabled = false;
-    exitCall();
-  }
-};
-
-/* ══════════════════════════════════════════════════════════
-   清空 & 退出
-══════════════════════════════════════════════════════════ */
-document.getElementById('clearBtn').onclick = () => {
-  messageArea.innerHTML = '';
-  currentItemA = null;
-  currentItemB = null;
-  pendingItems = {};
-};
-
-function cleanupAll() {
-  recordingRole = null;
-  audioPlaying = false;
-  isSpeaking = false;
-  silenceFrames = 0;
-  clearTimeout(audioDoneTimer);
-  [wsA, wsB].forEach(ws => { try { ws?.close(1000); } catch (e) {} });
-  wsA = wsB = null;
-  readyA = readyB = false;
-  [processorNode, sourceNode].forEach(n => { try { n?.disconnect(); } catch (e) {} });
-  mediaStream?.getTracks().forEach(t => t.stop());
-  try { audioCtx?.close(); } catch (e) {}
-  audioCtx = sourceNode = processorNode = mediaStream = null;
-  playCursor = 0;
-  playQueue = [];
-  currentItemA = null;
-  currentItemB = null;
-  pendingItems = {};
-}
-
-function exitCall() {
-  cleanupAll();
-  document.getElementById('callScreen').classList.remove('active');
-  document.getElementById('startScreen').classList.add('active');
-  messageArea.innerHTML = '';
-  startBtn.disabled = false;
-}
-
-document.getElementById('exitBtn').onclick = () => document.getElementById('exitModal').classList.add('active');
-document.getElementById('modalCancel').onclick = () => document.getElementById('exitModal').classList.remove('active');
-document.getElementById('modalConfirm').onclick = () => {
-  document.getElementById('exitModal').classList.remove('active');
-  exitCall();
-};
-document.getElementById('exitModal').onclick = (e) => {
-  if (e.target === e.currentTarget) document.getElementById('exitModal').classList.remove('active');
-};
-
-/* ══════════════════════════════════════════════════════════
-   保存记录
-══════════════════════════════════════════════════════════ */
-document.getElementById('saveBtn').onclick = () => {
-  const items = messageArea.querySelectorAll('.msg-item');
-  if (!items.length) { alert('当前没有对话记录'); return; }
-  let txt = `双向实时互译记录\n保存时间: ${new Date().toLocaleString()}\n${'='.repeat(40)}\n\n`;
-  items.forEach(item => {
-    const role = item.classList.contains('role-a') ? 'A' : 'B';
-    const orig = item.querySelector('.msg-original')?.textContent || '';
-    const trans = item.querySelector('.msg-translation')?.textContent || '';
-    if (trans.includes('翻译中')) return;
-    txt += `[${role}] ${orig}\n    → ${trans}\n\n`;
-  });
-  const blob = new Blob([txt], { type: 'text/plain;charset=utf-8' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = `互译记录_${new Date().toISOString().slice(0, 10)}.txt`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-};
-
-// ── 兜底：任何点击都尝试激活 AudioContext ──────────
-document.addEventListener('click', function() {
-  ensurePlayCtxFromGesture();
-}, { once: false });
-
-window.addEventListener('beforeunload', cleanupAll);
-</script>
-</body>
-  </html>
