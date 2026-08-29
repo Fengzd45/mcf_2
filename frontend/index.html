@@ -544,23 +544,35 @@ async function ensureMic() {
     mediaStream = await navigator.mediaDevices.getUserMedia({
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
     });
+    console.log('✅ 麦克风权限已获取');
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     sampleRate = audioCtx.sampleRate;
+    console.log(`✅ AudioContext 创建成功，采样率=${sampleRate}`);
     sourceNode = audioCtx.createMediaStreamSource(mediaStream);
     processorNode = audioCtx.createScriptProcessor(2048, 1, 1);
     sourceNode.connect(processorNode);
     processorNode.connect(audioCtx.destination);
 
+    // ─── 音频处理回调（已增强日志） ───
     processorNode.onaudioprocess = (e) => {
-      if (!recordingRole) return;
+      if (!recordingRole) {
+        // 当未录音时，不发送数据，但可添加一条极低频日志以避免刷屏
+        return;
+      }
       if (audioPlaying) return;
       const ws = recordingRole === 'a' ? wsA : wsB;
-      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        console.warn('⚠️ WebSocket 未就绪，无法发送音频');
+        return;
+      }
       const data = e.inputBuffer.getChannelData(0);
       const pcm = downsampleTo16k(data, sampleRate);
       const b64 = pcmToBase64(pcm);
+      // 日志：发送音频帧
+      console.log(`🎵 发送音频帧，role=${recordingRole}, 原始长度=${data.length}, PCM长度=${pcm.length}, base64长度=${b64.length}`);
       ws.send(JSON.stringify({ type: 'audio', data: b64 }));
 
+      // ─── VAD 静音检测 ───
       let sum = 0;
       for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
       const rms = Math.sqrt(sum / data.length);
@@ -572,6 +584,7 @@ async function ensureMic() {
           if (recordingRole === 'a') currentItemA = null;
           else currentItemB = null;
           statusBar.textContent = `🎤 ${recordingRole.toUpperCase()} 说话中...`;
+          console.log(`🗣️ ${recordingRole.toUpperCase()} 开始说话`);
         }
       } else {
         if (isSpeaking) {
@@ -581,6 +594,7 @@ async function ensureMic() {
             silenceFrames = 0;
             ws.send(JSON.stringify({ type: 'vad_stop' }));
             statusBar.textContent = `⏳ 静音断句中...`;
+            console.log(`🔇 ${recordingRole.toUpperCase()} 静音断句`);
           } else if (silenceFrames > 10) {
             statusBar.textContent = `⏳ 即将断句...`;
           }
@@ -589,12 +603,14 @@ async function ensureMic() {
     };
     return true;
   } catch (e) {
+    console.error('❌ 麦克风初始化失败:', e);
     alert('麦克风权限被拒绝: ' + e.message);
     return false;
   }
 }
 
 async function startRecording(role) {
+  console.log(`🎤 开始录音: ${role}`);
   const ok = await ensureMic();
   if (!ok) return;
   if (audioCtx.state === 'suspended') await audioCtx.resume();
@@ -613,17 +629,6 @@ async function startRecording(role) {
 
 /* ══════════════════════════════════════════════════════════
    音频播放（译音）
-   ────────────────────────────────────────────────────────
-   ⚠️ 修复说明：旧版用「1500ms 静音去抖」来决定何时开始播放
-   （enqueueAudio → setTimeout(flushQueue, 1500)），但 audio_done
-   之后的解锁定时器只等 500ms（onAudioDone 里 remaining 常年是 0，
-   因为 playCursor 还没被 flushQueue 更新过）。
-   500ms < 1500ms，于是几乎每次都是：解锁定时器先跑完，
-   unlockAfterPlay() 把 playQueue 清空 —— 然后 1500ms 的
-   flushQueue 才姗姗来迟，此时队列已经是空的，直接 return，
-   声音从未真正播放。这就是手机上（其实所有设备上）译音
-   播不出来的根本原因。
-   修复思路：音频分片一到就立即调度播放，不再等待去抖计时器。
 ══════════════════════════════════════════════════════════ */
 function enqueueAudio(b64) {
   if (!b64) return;
@@ -657,8 +662,6 @@ function enqueueAudio(b64) {
 
   playQueue.push(buf);
 
-  // ✅ 第一块音频到达即宣布"开始播放"状态并锁麦，
-  // 不再等待任何去抖计时器
   if (!audioPlaying) {
     audioPlaying = true;
     if (recordingRole) {
@@ -669,14 +672,12 @@ function enqueueAudio(b64) {
     playCursor = playCtx.currentTime;
     refreshMicUI();
     statusBar.textContent = '🔊 播放译音中，请稍后...';
+    console.log('🔊 开始播放译音');
   }
 
   drainQueue();
 }
 
-// ✅ 把队列里所有已到达的分片一次性排入播放时间轴，
-// 依靠 playCursor 累加保证分片之间严丝合缝、没有空档，
-// 不再依赖 onended 回调递归触发（手机后台/节流时回调可能被延迟）。
 function drainQueue() {
   while (playQueue.length > 0) {
     const buf = playQueue.shift();
@@ -712,24 +713,23 @@ function unlockAfterPlay() {
   } else {
     statusBar.textContent = '✅ 译音结束，请点击麦克风说话';
   }
+  console.log('🔊 译音播放结束');
 }
 
 /* ══════════════════════════════════════════════════════════
-   🔧 WebSocket - 强制使用 wss 和硬编码域名
+   WebSocket - 强制使用 wss 和硬编码域名（已加日志）
 ══════════════════════════════════════════════════════════ */
 function connectWs(role, lang, targetLang) {
   return new Promise((resolve, reject) => {
-    // ✅ 关键修复：硬编码域名 + 强制 wss
     const host = 'mcf-2.onrender.com';
     const wsUrl = `wss://${host}/ws/${roomId}/${role}`;
-    
     console.log(`🔗 连接 ${role}: ${wsUrl}`);
     const ws = new WebSocket(wsUrl);
     ws._role = role;
-    
-    const timer = setTimeout(() => { 
-      ws.close(); 
-      reject(new Error(`${role} 连接超时 (30s)`)); 
+    const timer = setTimeout(() => {
+      ws.close();
+      console.error(`⏰ ${role} 连接超时`);
+      reject(new Error(`${role} 连接超时 (30s)`));
     }, 30000);
 
     ws.onopen = () => {
@@ -737,31 +737,29 @@ function connectWs(role, lang, targetLang) {
       console.log(`✅ ${role} WebSocket 已打开`);
       ws.send(JSON.stringify({ type: 'init', lang: lang, target_lang: targetLang }));
     };
-    
-    ws.onerror = (e) => { 
-      clearTimeout(timer); 
+    ws.onerror = (e) => {
+      clearTimeout(timer);
       console.error(`❌ ${role} WebSocket 错误:`, e);
-      reject(new Error(`${role} 连接失败`)); 
+      reject(new Error(`${role} 连接失败`));
     };
-    
     ws.onclose = (e) => {
       clearTimeout(timer);
-      console.log(`🔌 ${role} WebSocket 已关闭, code=${e.code}`);
+      console.log(`🔌 ${role} WebSocket 关闭, code=${e.code}`);
       if (role === 'a') readyA = false;
       else readyB = false;
       refreshMicUI();
     };
-    
     ws.onmessage = (ev) => {
       try {
         const msg = JSON.parse(ev.data);
+        console.log(`📨 [${role}] 收到消息:`, msg.kind, msg.sid ? `sid=${msg.sid}` : '');
         if (msg.kind === 'status' && msg.paired) {
           clearTimeout(timer);
           resolve(ws);
         }
         handleMessage(ws._role, msg);
-      } catch (e) { 
-        console.error('消息解析失败:', e); 
+      } catch (e) {
+        console.error('消息解析失败:', e);
       }
     };
   });
@@ -771,8 +769,6 @@ function connectWs(role, lang, targetLang) {
    消息处理 - 用 sid 配对原文和译文
 ══════════════════════════════════════════════════════════ */
 function handleMessage(role, msg) {
-  console.log(`📨 [${role}] 收到:`, msg.kind, msg.sid ? `sid=${msg.sid}` : '');
-
   switch (msg.kind) {
 
     case 'status':
@@ -783,7 +779,6 @@ function handleMessage(role, msg) {
     case 'self_original': {
       if (!msg.text || msg.text.length < 1) break;
 
-      // 流式原文：只更新，不创建
       if (!msg.final) {
         let item = role === 'a' ? currentItemA : currentItemB;
         if (item) {
@@ -794,13 +789,10 @@ function handleMessage(role, msg) {
         break;
       }
 
-      // 最终原文
       const sid = msg.sid || Date.now() + '_' + Math.random();
 
-      // 检查是否有译文先到（在 pendingItems 中）
       let entry = pendingItems[sid];
       if (entry) {
-        // 译文已先到，更新原文
         const origDiv = entry.item.querySelector('.msg-original');
         origDiv.textContent = msg.text;
         entry.original = msg.text;
@@ -812,7 +804,6 @@ function handleMessage(role, msg) {
         break;
       }
 
-      // 创建新卡片
       const item = createNewItem(role);
       const origDiv = item.querySelector('.msg-original');
       origDiv.textContent = msg.text;
@@ -820,7 +811,6 @@ function handleMessage(role, msg) {
       transDiv.textContent = '⏳ 翻译中...';
       transDiv.classList.add('pending');
 
-      // 存入待配对队列
       pendingItems[sid] = {
         item: item,
         role: role,
@@ -840,7 +830,6 @@ function handleMessage(role, msg) {
     case 'self_translation': {
       if (!msg.text || msg.text.length < 1) break;
 
-      // 流式译文：只更新，不创建
       if (!msg.final) {
         let item = role === 'a' ? currentItemA : currentItemB;
         if (item) {
@@ -852,13 +841,10 @@ function handleMessage(role, msg) {
         break;
       }
 
-      // 最终译文
       const sid = msg.sid || Date.now() + '_' + Math.random();
 
-      // 查找对应的原文卡片
       let entry = pendingItems[sid];
       if (entry) {
-        // 原文已到，更新译文
         const transDiv = entry.item.querySelector('.msg-translation');
         transDiv.textContent = msg.text;
         transDiv.classList.remove('pending');
@@ -872,7 +858,6 @@ function handleMessage(role, msg) {
         break;
       }
 
-      // 译文先到：创建卡片，原文待填充
       const item = createNewItem(role);
       const origDiv = item.querySelector('.msg-original');
       origDiv.textContent = '…';
@@ -896,7 +881,7 @@ function handleMessage(role, msg) {
     }
 
     case 'self_audio':
-      console.log(`🔊 [${role}] 收到译音`);
+      console.log(`🔊 [${role}] 收到译音分片`);
       enqueueAudio(msg.audio);
       break;
 
@@ -969,8 +954,6 @@ function pcmToBase64(f32) {
 startBtn.onclick = async () => {
   if (startBtn.disabled) return;
 
-  // ✅ 在“开始通话”这个用户手势里就先激活播放用的 AudioContext，
-  // 尽早满足手机浏览器的手势要求，减少后续第一次播放失败的概率
   ensurePlayCtxFromGesture();
 
   const lang1 = lang1Sel.value;
@@ -992,6 +975,7 @@ startBtn.onclick = async () => {
   playCursor = playCtx ? playCtx.currentTime : 0;
 
   roomId = 'room_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+  console.log(`🆕 创建房间: ${roomId}`);
 
   document.getElementById('startScreen').classList.remove('active');
   document.getElementById('callScreen').classList.add('active');
@@ -1010,7 +994,9 @@ startBtn.onclick = async () => {
     statusBar.textContent = '✅ 已连接，点击麦克风开始说话（静音自动断句）';
     refreshMicUI();
     startBtn.disabled = false;
+    console.log('✅ 双通道连接成功');
   } catch (e) {
+    console.error('❌ 连接失败:', e);
     alert('连接失败: ' + e.message);
     startBtn.disabled = false;
     exitCall();
