@@ -29,7 +29,7 @@ def log(msg: str, level: str = "INFO"):
 
 # ── 环境变量 ──────────────────────────────────────────────
 DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
-WORKSPACE_ID = os.environ.get("WORKSPACE_ID", "")
+WORKSPACE_ID = os.environ.get("DASHSCOPE_WORKSPACE_ID", "")
 REGION = os.environ.get("REGION", "cn-beijing")
 MODEL = os.environ.get("MODEL", "qwen3-translation-realtime-v1")
 SILENCE_PCM = base64.b64encode(b"\x00" * 3200).decode()
