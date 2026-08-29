@@ -21,10 +21,12 @@
 
 ```bash
 export DASHSCOPE_API_KEY=sk-xxx
-export DASHSCOPE_WORKSPACE_ID=ws-xxx
-export BAILIAN_REGION=cn-beijing          # 可选，默认 cn-beijing
-export LIVETRANSLATE_MODEL=qwen3.5-livetranslate-flash-realtime  # 可选
+export WORKSPACE_ID=ws-xxx
+export REGION=cn-beijing                          # 可选，默认 cn-beijing
+export MODEL=qwen3-translation-realtime-v1         # 可选，默认见 main.py
 ```
+
+> 部署到 Render 时，在服务的 Environment 页面按上面这四个变量名设置（不是 `DASHSCOPE_WORKSPACE_ID` / `BAILIAN_REGION` / `LIVETRANSLATE_MODEL`，main.py 实际读取的是 `WORKSPACE_ID` / `REGION` / `MODEL`）。Render 会自动注入 `PORT`，不需要手动设置。
 
 ## 安装 & 启动
 
