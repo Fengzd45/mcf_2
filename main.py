@@ -8,7 +8,7 @@ import requests
 from typing import Dict, Optional
 from fastapi import FastAPI, WebSocketDisconnect, WebSocket
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import HTMLResponse
 from contextlib import asynccontextmanager
 
 import dashscope
@@ -189,8 +189,17 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 # ── 静态文件 ──────────────────────────────────────────────
-# 挂载 static 目录到根路径（你已重命名 frontend → static）
-app.mount("/", StaticFiles(directory="static", html=True), name="root")
+# 挂载 static 目录到 /static 路径
+app.mount("/static", StaticFiles(directory="static", html=True), name="static")
+
+# 根路径返回 index.html（不拦截 WebSocket）
+@app.get("/")
+async def get_index():
+    index_path = os.path.join("static", "index.html")
+    if os.path.exists(index_path):
+        with open(index_path, "r", encoding="utf-8") as f:
+            return HTMLResponse(content=f.read())
+    return HTMLResponse(content="<h1>index.html not found</h1>", status_code=404)
 
 
 # ── WebSocket 端点 ────────────────────────────────────────
