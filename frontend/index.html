@@ -1,0 +1,1079 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>实时互译</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  height: 100%;
+  background: #0d0d0d;
+  color: #eee;
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
+  touch-action: manipulation;
+  overflow: hidden;
+}
+
+/* ── 屏幕切换 ── */
+.screen { display: none; height: 100%; flex-direction: column; }
+.screen.active { display: flex; }
+
+/* ══════════════════════════════
+   开始屏幕
+══════════════════════════════ */
+#startScreen {
+  justify-content: center;
+  align-items: center;
+  gap: 24px;
+  padding: 32px 24px;
+  text-align: center;
+  background: #0d0d0d;
+}
+#startScreen h2 { font-size: 24px; color: #8ecfff; letter-spacing: 1px; }
+#startScreen .subtitle { font-size: 13px; color: #555; }
+
+.lang-row {
+  display: flex;
+  gap: 20px;
+  flex-wrap: wrap;
+  justify-content: center;
+  width: 100%;
+  max-width: 360px;
+}
+.lang-box {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: center;
+  flex: 1;
+  min-width: 130px;
+}
+.lang-box label {
+  font-size: 13px;
+  color: #888;
+  font-weight: 500;
+}
+.lang-label-a { color: #4fc3f7 !important; }
+.lang-label-b { color: #ffb74d !important; }
+
+.lang-box select {
+  width: 100%;
+  font-size: 16px;
+  padding: 10px 12px;
+  background: #1a1a1a;
+  color: #eee;
+  border: 1px solid #333;
+  border-radius: 10px;
+  appearance: none;
+  text-align: center;
+}
+
+.bigBtn {
+  width: 220px;
+  padding: 16px;
+  font-size: 18px;
+  border: none;
+  border-radius: 14px;
+  color: #fff;
+  cursor: pointer;
+  background: linear-gradient(135deg, #1b5e20, #2e7d32);
+  box-shadow: 0 4px 16px rgba(46,125,50,0.4);
+  transition: transform 0.1s, box-shadow 0.1s;
+}
+.bigBtn:active { transform: scale(0.96); box-shadow: none; }
+.bigBtn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+
+/* ══════════════════════════════
+   通话屏幕
+══════════════════════════════ */
+#callScreen {
+  height: 100%;
+  background: #0d0d0d;
+}
+
+/* 顶栏 */
+#topBar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 14px;
+  background: #111;
+  border-bottom: 1px solid #222;
+  flex-shrink: 0;
+}
+#topBar .title { font-size: 15px; font-weight: bold; color: #8ecfff; }
+.top-actions { display: flex; gap: 8px; align-items: center; }
+.top-btn {
+  background: rgba(255,255,255,0.06);
+  color: #aaa;
+  border: 1px solid #333;
+  border-radius: 8px;
+  padding: 6px 12px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.top-btn-exit {
+  background: rgba(255,60,60,0.12);
+  color: #ff6b6b;
+  border-color: rgba(255,60,60,0.25);
+}
+
+/* 状态栏 */
+#statusBar {
+  padding: 5px 14px;
+  text-align: center;
+  font-size: 12px;
+  color: #666;
+  background: #0d0d0d;
+  border-bottom: 1px solid #1a1a1a;
+  flex-shrink: 0;
+  min-height: 26px;
+}
+
+/* ══════════════════════════════
+   消息区 - 单列滚动窗口
+══════════════════════════════ */
+#messageArea {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  background: #0d0d0d;
+}
+#messageArea:empty::after {
+  content: "💬 点击下方麦克风开始说话";
+  display: block;
+  margin: auto;
+  color: #333;
+  font-size: 14px;
+}
+
+/* 消息卡片 */
+.msg-item {
+  background: #141414;
+  border-radius: 10px;
+  padding: 10px 14px;
+  border-left: 4px solid #333;
+  box-shadow: 0 1px 6px rgba(0,0,0,0.4);
+  width: 100%;
+}
+
+.msg-item.role-a { border-left-color: #4fc3f7; }
+.msg-item.role-b { border-left-color: #ffb74d; }
+
+.msg-header {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: #888;
+  margin-bottom: 4px;
+}
+
+.msg-original {
+  font-size: 16px;
+  line-height: 1.5;
+  color: #ddd;
+  margin-bottom: 4px;
+}
+.msg-translation {
+  font-size: 15px;
+  line-height: 1.5;
+  color: #ffe58e;
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid #2a2a2a;
+}
+.msg-translation.pending {
+  color: #666;
+  font-style: italic;
+}
+
+/* ══════════════════════════════
+   AB 双麦克风键
+══════════════════════════════ */
+#micArea {
+  display: flex;
+  flex-shrink: 0;
+  border-top: 1px solid #1a1a1a;
+  background: #0a0a0a;
+}
+
+.mic-btn-wrap {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 14px 10px 18px;
+  gap: 8px;
+  border-right: 1px solid #1a1a1a;
+}
+.mic-btn-wrap:last-child { border-right: none; }
+
+.mic-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  opacity: 0.5;
+}
+.mic-label-a { color: #4fc3f7; }
+.mic-label-b { color: #ffb74d; }
+
+.mic-btn {
+  width: 72px;
+  height: 72px;
+  border-radius: 50%;
+  border: none;
+  font-size: 28px;
+  cursor: pointer;
+  transition: transform 0.12s, box-shadow 0.12s, background 0.15s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+}
+
+#micA {
+  background: #1a2a3a;
+  box-shadow: 0 0 0 3px rgba(79,195,247,0.2);
+  color: #4fc3f7;
+}
+#micA:active { transform: scale(0.93); }
+
+#micB {
+  background: #2a1e0a;
+  box-shadow: 0 0 0 3px rgba(255,183,77,0.2);
+  color: #ffb74d;
+}
+#micB:active { transform: scale(0.93); }
+
+.mic-btn.recording {
+  animation: micPulse 1.2s infinite;
+}
+#micA.recording {
+  background: #0a4a7a;
+  box-shadow: 0 0 0 6px rgba(79,195,247,0.25);
+}
+#micB.recording {
+  background: #5a2e00;
+  box-shadow: 0 0 0 6px rgba(255,183,77,0.25);
+}
+
+.mic-btn.locked {
+  opacity: 0.25;
+  cursor: not-allowed;
+  animation: none;
+}
+.mic-btn.locked:active { transform: none; }
+
+@keyframes micPulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.08); }
+}
+
+.mic-status {
+  font-size: 11px;
+  color: #444;
+  height: 16px;
+  text-align: center;
+}
+.mic-status.active-a { color: #4fc3f7; }
+.mic-status.active-b { color: #ffb74d; }
+.mic-status.locked   { color: #333; }
+
+.status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 4px;
+  background: #555;
+  transition: background 0.3s;
+  vertical-align: middle;
+}
+.status-dot.idle { background: #555; }
+.status-dot.recording { background: #ff4444; animation: blink 0.8s infinite; }
+.status-dot.playing { background: #ffaa00; animation: blink 0.5s infinite; }
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.2; }
+}
+
+/* ══════════════════════════════
+   退出弹窗
+══════════════════════════════ */
+.modal-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.75);
+  z-index: 200;
+  justify-content: center;
+  align-items: center;
+}
+.modal-overlay.active { display: flex; }
+.modal-box {
+  background: #1e1e1e;
+  border-radius: 16px;
+  padding: 28px 24px 22px;
+  max-width: 300px;
+  width: 88%;
+  text-align: center;
+  border: 1px solid #333;
+}
+.modal-box h3 { font-size: 18px; margin-bottom: 8px; }
+.modal-box p  { font-size: 13px; color: #999; margin-bottom: 20px; }
+.modal-actions { display: flex; gap: 12px; justify-content: center; }
+.modal-actions button {
+  padding: 10px 26px;
+  border: none;
+  border-radius: 10px;
+  font-size: 14px;
+  cursor: pointer;
+}
+.modal-cancel  { background: #444; color: #eee; }
+.modal-confirm { background: #c62828; color: #fff; }
+</style>
+</head>
+<body>
+
+<!-- ══ 开始屏幕 ══ -->
+<div id="startScreen" class="screen active">
+  <h2>🗣️ 实时互译</h2>
+  <div class="lang-row">
+    <div class="lang-box">
+      <label class="lang-label-a">语言 A</label>
+      <select id="lang1"></select>
+    </div>
+    <div class="lang-box">
+      <label class="lang-label-b">语言 B</label>
+      <select id="lang2"></select>
+    </div>
+  </div>
+  <button class="bigBtn" id="startBtn">🚀 开始通话</button>
+  <div class="subtitle">点击麦克风键说话 · 静音自动断句 · 译音播完可继续说</div>
+</div>
+
+<!-- ══ 通话屏幕 ══ -->
+<div id="callScreen" class="screen">
+
+  <div id="topBar">
+    <span class="title">🔄 互译中</span>
+    <div class="top-actions">
+      <button class="top-btn" id="clearBtn">🗑️ 清空</button>
+      <button class="top-btn" id="saveBtn">📁 保存</button>
+      <button class="top-btn top-btn-exit" id="exitBtn">✕</button>
+    </div>
+  </div>
+
+  <div id="statusBar">⏳ 连接中...</div>
+
+  <div id="messageArea"></div>
+
+  <!-- AB双麦克风键 -->
+  <div id="micArea">
+    <div class="mic-btn-wrap">
+      <div class="mic-label mic-label-a">A 说话</div>
+      <button class="mic-btn locked" id="micA">🎤</button>
+      <div class="mic-status" id="statusA"><span class="status-dot idle"></span>等待连接</div>
+    </div>
+    <div class="mic-btn-wrap">
+      <div class="mic-label mic-label-b">B 说话</div>
+      <button class="mic-btn locked" id="micB">🎤</button>
+      <div class="mic-status" id="statusB"><span class="status-dot idle"></span>等待连接</div>
+    </div>
+  </div>
+</div>
+
+<!-- 退出弹窗 -->
+<div class="modal-overlay" id="exitModal">
+  <div class="modal-box">
+    <h3>结束通话？</h3>
+    <p>退出将断开所有连接</p>
+    <div class="modal-actions">
+      <button class="modal-cancel" id="modalCancel">取消</button>
+      <button class="modal-confirm" id="modalConfirm">确认退出</button>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ══════════════════════════════════════════════════════════
+   常量 & 语言列表
+══════════════════════════════════════════════════════════ */
+const LANGS = [
+  ['zh','中文'], ['en','English'], ['ja','日本語'], ['ko','한국어'],
+  ['fr','Français'], ['de','Deutsch'], ['es','Español'], ['ru','Русский'],
+  ['ar','العربية'], ['th','ไทย'], ['vi','Tiếng Việt'], ['pt','Português'],
+];
+
+const lang1Sel = document.getElementById('lang1');
+const lang2Sel = document.getElementById('lang2');
+const startBtn = document.getElementById('startBtn');
+const messageArea = document.getElementById('messageArea');
+const statusBar = document.getElementById('statusBar');
+const micA = document.getElementById('micA');
+const micB = document.getElementById('micB');
+const statusA = document.getElementById('statusA');
+const statusB = document.getElementById('statusB');
+
+LANGS.forEach(([code, name]) => {
+  [lang1Sel, lang2Sel].forEach(sel => {
+    const o = document.createElement('option');
+    o.value = code; o.textContent = name;
+    sel.appendChild(o);
+  });
+});
+lang1Sel.value = 'zh';
+lang2Sel.value = 'en';
+
+/* ══════════════════════════════════════════════════════════
+   状态变量
+══════════════════════════════════════════════════════════ */
+let wsA = null, wsB = null;
+let roomId = '';
+let audioCtx = null, sourceNode = null, processorNode = null, mediaStream = null;
+let recordingRole = null;
+let audioPlaying = false;
+let audioDoneTimer = null;
+let readyA = false, readyB = false;
+
+const SILENCE_THRESHOLD = 0.005;
+const SILENCE_FRAMES_MAX = 30;
+let silenceFrames = 0;
+let isSpeaking = false;
+let sampleRate = 16000;
+
+let playCtx = null;
+let playCursor = 0;
+let playQueue = [];
+
+let currentItemA = null;
+let currentItemB = null;
+
+// ✅ 用 sid 配对原文和译文（解决顺序问题）
+let pendingItems = {};
+
+/* ══════════════════════════════════════════════════════════
+   UI 状态
+══════════════════════════════════════════════════════════ */
+function setMicState(role, state) {
+  const btn = role === 'a' ? micA : micB;
+  const sts = role === 'a' ? statusA : statusB;
+  btn.classList.remove('locked', 'recording');
+
+  if (state === 'locked') {
+    btn.classList.add('locked');
+    sts.innerHTML = `<span class="status-dot idle"></span>${audioPlaying ? '🔊 播放中' : (recordingRole ? '录音中...' : '锁定')}`;
+  } else if (state === 'idle') {
+    sts.innerHTML = `<span class="status-dot idle"></span>点击说话`;
+  } else if (state === 'recording') {
+    btn.classList.add('recording');
+    sts.innerHTML = `<span class="status-dot recording"></span>🔴 说话中...`;
+  }
+}
+
+function refreshMicUI() {
+  if (!readyA || !readyB) {
+    setMicState('a', 'locked');
+    setMicState('b', 'locked');
+    return;
+  }
+  if (audioPlaying) {
+    setMicState('a', 'locked');
+    setMicState('b', 'locked');
+    return;
+  }
+  if (recordingRole === 'a') {
+    setMicState('a', 'recording');
+    setMicState('b', 'idle');
+  } else if (recordingRole === 'b') {
+    setMicState('a', 'idle');
+    setMicState('b', 'recording');
+  } else {
+    setMicState('a', 'idle');
+    setMicState('b', 'idle');
+  }
+}
+
+/* ══════════════════════════════════════════════════════════
+   麦克风
+══════════════════════════════════════════════════════════ */
+micA.onclick = () => handleMicClick('a');
+micB.onclick = () => handleMicClick('b');
+
+function handleMicClick(role) {
+  if (audioPlaying) {
+    statusBar.textContent = '⏳ 译音播放中，请稍后...';
+    return;
+  }
+  if (!readyA || !readyB) return;
+  if (recordingRole === role) return;
+
+  ensurePlayCtxFromGesture();
+
+  startRecording(role);
+}
+
+// ✅ 手机浏览器（尤其 iOS Safari）要求 AudioContext 的创建/resume
+// 必须发生在“用户手势”的同步调用栈里才能真正生效。
+// 这个函数被所有点击类事件直接同步调用，专门负责这件事。
+function ensurePlayCtxFromGesture() {
+  if (!playCtx || playCtx.state === 'closed') {
+    try {
+      playCtx = new (window.AudioContext || window.webkitAudioContext)();
+      playCursor = playCtx.currentTime;
+      console.log('✅ 创建 playCtx（用户手势内）');
+    } catch (e) {
+      console.warn('创建 playCtx 失败:', e);
+    }
+  }
+  if (playCtx && playCtx.state === 'suspended') {
+    playCtx.resume().catch(e => console.warn('resume 失败:', e));
+  }
+}
+
+async function ensureMic() {
+  if (audioCtx) return true;
+  try {
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    });
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    sampleRate = audioCtx.sampleRate;
+    sourceNode = audioCtx.createMediaStreamSource(mediaStream);
+    processorNode = audioCtx.createScriptProcessor(2048, 1, 1);
+    sourceNode.connect(processorNode);
+    processorNode.connect(audioCtx.destination);
+
+    processorNode.onaudioprocess = (e) => {
+      if (!recordingRole) return;
+      if (audioPlaying) return;
+      const ws = recordingRole === 'a' ? wsA : wsB;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      const data = e.inputBuffer.getChannelData(0);
+      const pcm = downsampleTo16k(data, sampleRate);
+      const b64 = pcmToBase64(pcm);
+      ws.send(JSON.stringify({ type: 'audio', data: b64 }));
+
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
+      const rms = Math.sqrt(sum / data.length);
+
+      if (rms > SILENCE_THRESHOLD) {
+        silenceFrames = 0;
+        if (!isSpeaking) {
+          isSpeaking = true;
+          if (recordingRole === 'a') currentItemA = null;
+          else currentItemB = null;
+          statusBar.textContent = `🎤 ${recordingRole.toUpperCase()} 说话中...`;
+        }
+      } else {
+        if (isSpeaking) {
+          silenceFrames++;
+          if (silenceFrames > SILENCE_FRAMES_MAX) {
+            isSpeaking = false;
+            silenceFrames = 0;
+            ws.send(JSON.stringify({ type: 'vad_stop' }));
+            statusBar.textContent = `⏳ 静音断句中...`;
+          } else if (silenceFrames > 10) {
+            statusBar.textContent = `⏳ 即将断句...`;
+          }
+        }
+      }
+    };
+    return true;
+  } catch (e) {
+    alert('麦克风权限被拒绝: ' + e.message);
+    return false;
+  }
+}
+
+async function startRecording(role) {
+  const ok = await ensureMic();
+  if (!ok) return;
+  if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+  ensurePlayCtxFromGesture();
+  if (playCtx && playCtx.state === 'suspended') {
+    await playCtx.resume();
+  }
+
+  recordingRole = role;
+  isSpeaking = false;
+  silenceFrames = 0;
+  refreshMicUI();
+  statusBar.textContent = `🎤 ${role.toUpperCase()} 说话中...`;
+}
+
+/* ══════════════════════════════════════════════════════════
+   音频播放（译音）
+   ────────────────────────────────────────────────────────
+   ⚠️ 修复说明：旧版用「1500ms 静音去抖」来决定何时开始播放
+   （enqueueAudio → setTimeout(flushQueue, 1500)），但 audio_done
+   之后的解锁定时器只等 500ms（onAudioDone 里 remaining 常年是 0，
+   因为 playCursor 还没被 flushQueue 更新过）。
+   500ms < 1500ms，于是几乎每次都是：解锁定时器先跑完，
+   unlockAfterPlay() 把 playQueue 清空 —— 然后 1500ms 的
+   flushQueue 才姗姗来迟，此时队列已经是空的，直接 return，
+   声音从未真正播放。这就是手机上（其实所有设备上）译音
+   播不出来的根本原因。
+   修复思路：音频分片一到就立即调度播放，不再等待去抖计时器。
+══════════════════════════════════════════════════════════ */
+function enqueueAudio(b64) {
+  if (!b64) return;
+
+  if (!playCtx || playCtx.state === 'closed') {
+    try {
+      console.warn('⚠️ playCtx 无效，重新创建');
+      playCtx = new (window.AudioContext || window.webkitAudioContext)();
+      playCursor = playCtx.currentTime;
+    } catch (e) {
+      console.warn('创建 playCtx 失败:', e);
+      return;
+    }
+  }
+  if (playCtx.state === 'suspended') {
+    playCtx.resume().catch(e => console.warn('resume 失败:', e));
+  }
+
+  let buf;
+  try {
+    const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+    const int16 = new Int16Array(bytes.buffer);
+    const float32 = new Float32Array(int16.length);
+    for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 0x8000;
+    buf = playCtx.createBuffer(1, float32.length, 24000);
+    buf.copyToChannel(float32, 0);
+  } catch (e) {
+    console.error('音频解码失败:', e);
+    return;
+  }
+
+  playQueue.push(buf);
+
+  // ✅ 第一块音频到达即宣布"开始播放"状态并锁麦，
+  // 不再等待任何去抖计时器
+  if (!audioPlaying) {
+    audioPlaying = true;
+    if (recordingRole) {
+      recordingRole = null;
+      isSpeaking = false;
+      silenceFrames = 0;
+    }
+    playCursor = playCtx.currentTime;
+    refreshMicUI();
+    statusBar.textContent = '🔊 播放译音中，请稍后...';
+  }
+
+  drainQueue();
+}
+
+// ✅ 把队列里所有已到达的分片一次性排入播放时间轴，
+// 依靠 playCursor 累加保证分片之间严丝合缝、没有空档，
+// 不再依赖 onended 回调递归触发（手机后台/节流时回调可能被延迟）。
+function drainQueue() {
+  while (playQueue.length > 0) {
+    const buf = playQueue.shift();
+    const src = playCtx.createBufferSource();
+    src.buffer = buf;
+    src.connect(playCtx.destination);
+    const startAt = Math.max(playCtx.currentTime, playCursor);
+    src.start(startAt);
+    playCursor = startAt + buf.duration;
+  }
+}
+
+function onAudioDone() {
+  clearTimeout(audioDoneTimer);
+  const remaining = Math.max(0, playCursor - (playCtx?.currentTime || 0)) * 1000;
+  audioDoneTimer = setTimeout(unlockAfterPlay, Math.max(remaining + 200, 500));
+}
+
+function startAudioDoneWatchdog() {
+  clearTimeout(audioDoneTimer);
+  audioDoneTimer = setTimeout(() => { if (audioPlaying) unlockAfterPlay(); }, 8000);
+}
+
+function unlockAfterPlay() {
+  audioPlaying = false;
+  playCursor = playCtx ? playCtx.currentTime : 0;
+  playQueue = [];
+  silenceFrames = 0;
+  isSpeaking = false;
+  refreshMicUI();
+  if (recordingRole) {
+    statusBar.textContent = `✅ 译音结束，${recordingRole.toUpperCase()} 可继续说`;
+  } else {
+    statusBar.textContent = '✅ 译音结束，请点击麦克风说话';
+  }
+}
+
+/* ══════════════════════════════════════════════════════════
+   WebSocket
+══════════════════════════════════════════════════════════ */
+function connectWs(role, lang, targetLang) {
+  return new Promise((resolve, reject) => {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const ws = new WebSocket(`${proto}://${location.host}/ws/${roomId}/${role}`);
+    ws._role = role;
+    const timer = setTimeout(() => { ws.close(); reject(new Error(`${role} 连接超时`)); }, 30000);
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ type: 'init', lang: lang, target_lang: targetLang }));
+    };
+    ws.onerror = (e) => { clearTimeout(timer); reject(e); };
+    ws.onclose = () => {
+      clearTimeout(timer);
+      if (role === 'a') readyA = false;
+      else readyB = false;
+      refreshMicUI();
+    };
+    ws.onmessage = (ev) => {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg.kind === 'status' && msg.paired) {
+          clearTimeout(timer);
+          resolve(ws);
+        }
+        handleMessage(ws._role, msg);
+      } catch (e) { console.error('消息解析失败:', e); }
+    };
+  });
+}
+
+/* ══════════════════════════════════════════════════════════
+   消息处理 - 用 sid 配对原文和译文
+══════════════════════════════════════════════════════════ */
+function handleMessage(role, msg) {
+  console.log(`📨 [${role}] 收到:`, msg.kind, msg.sid ? `sid=${msg.sid}` : '');
+
+  switch (msg.kind) {
+
+    case 'status':
+      statusBar.textContent = msg.text;
+      break;
+
+    // ── 原文 ──
+    case 'self_original': {
+      if (!msg.text || msg.text.length < 1) break;
+
+      // 流式原文：只更新，不创建
+      if (!msg.final) {
+        let item = role === 'a' ? currentItemA : currentItemB;
+        if (item) {
+          const origDiv = item.querySelector('.msg-original');
+          origDiv.textContent = msg.text + '…';
+        }
+        scrollBottom();
+        break;
+      }
+
+      // 最终原文
+      const sid = msg.sid || Date.now() + '_' + Math.random();
+
+      // 检查是否有译文先到（在 pendingItems 中）
+      let entry = pendingItems[sid];
+      if (entry) {
+        // 译文已先到，更新原文
+        const origDiv = entry.item.querySelector('.msg-original');
+        origDiv.textContent = msg.text;
+        entry.original = msg.text;
+        entry.state = 'complete';
+        delete pendingItems[sid];
+        if (role === 'a') currentItemA = entry.item;
+        else currentItemB = entry.item;
+        scrollBottom();
+        break;
+      }
+
+      // 创建新卡片
+      const item = createNewItem(role);
+      const origDiv = item.querySelector('.msg-original');
+      origDiv.textContent = msg.text;
+      const transDiv = item.querySelector('.msg-translation');
+      transDiv.textContent = '⏳ 翻译中...';
+      transDiv.classList.add('pending');
+
+      // 存入待配对队列
+      pendingItems[sid] = {
+        item: item,
+        role: role,
+        original: msg.text,
+        translation: null,
+        state: 'waiting_translation'
+      };
+
+      if (role === 'a') currentItemA = item;
+      else currentItemB = item;
+
+      scrollBottom();
+      break;
+    }
+
+    // ── 译文 ──
+    case 'self_translation': {
+      if (!msg.text || msg.text.length < 1) break;
+
+      // 流式译文：只更新，不创建
+      if (!msg.final) {
+        let item = role === 'a' ? currentItemA : currentItemB;
+        if (item) {
+          const transDiv = item.querySelector('.msg-translation');
+          transDiv.textContent = msg.text + '…';
+          transDiv.classList.remove('pending');
+        }
+        scrollBottom();
+        break;
+      }
+
+      // 最终译文
+      const sid = msg.sid || Date.now() + '_' + Math.random();
+
+      // 查找对应的原文卡片
+      let entry = pendingItems[sid];
+      if (entry) {
+        // 原文已到，更新译文
+        const transDiv = entry.item.querySelector('.msg-translation');
+        transDiv.textContent = msg.text;
+        transDiv.classList.remove('pending');
+        entry.translation = msg.text;
+        entry.state = 'complete';
+        delete pendingItems[sid];
+        startAudioDoneWatchdog();
+        if (role === 'a') currentItemA = entry.item;
+        else currentItemB = entry.item;
+        scrollBottom();
+        break;
+      }
+
+      // 译文先到：创建卡片，原文待填充
+      const item = createNewItem(role);
+      const origDiv = item.querySelector('.msg-original');
+      origDiv.textContent = '…';
+      const transDiv = item.querySelector('.msg-translation');
+      transDiv.textContent = msg.text;
+      transDiv.classList.remove('pending');
+
+      pendingItems[sid] = {
+        item: item,
+        role: role,
+        original: null,
+        translation: msg.text,
+        state: 'waiting_original'
+      };
+
+      if (role === 'a') currentItemA = item;
+      else currentItemB = item;
+
+      scrollBottom();
+      break;
+    }
+
+    case 'self_audio':
+      console.log(`🔊 [${role}] 收到译音`);
+      enqueueAudio(msg.audio);
+      break;
+
+    case 'audio_done':
+      console.log(`🔔 [${role}] 译音完成`);
+      onAudioDone();
+      break;
+  }
+}
+
+function createNewItem(role) {
+  const item = document.createElement('div');
+  item.className = `msg-item role-${role}`;
+
+  const header = document.createElement('div');
+  header.className = 'msg-header';
+  const roleLabel = role.toUpperCase();
+  const direction = role === 'a' ? '中文 → 英文' : '英文 → 中文';
+  header.innerHTML = `
+    <span style="font-weight:bold;color:${role === 'a' ? '#4fc3f7' : '#ffb74d'}">${roleLabel}</span>
+    <span style="font-size:10px;color:#555;">${direction}</span>
+  `;
+  item.appendChild(header);
+
+  const orig = document.createElement('div');
+  orig.className = 'msg-original';
+  orig.textContent = '…';
+  item.appendChild(orig);
+
+  const trans = document.createElement('div');
+  trans.className = 'msg-translation pending';
+  trans.textContent = '⏳ 翻译中...';
+  item.appendChild(trans);
+
+  messageArea.appendChild(item);
+  return item;
+}
+
+function scrollBottom() {
+  messageArea.scrollTop = messageArea.scrollHeight;
+}
+
+/* ══════════════════════════════════════════════════════════
+   工具函数
+══════════════════════════════════════════════════════════ */
+function downsampleTo16k(f32, inRate) {
+  if (inRate === 16000) return f32;
+  const ratio = inRate / 16000;
+  const newLen = Math.round(f32.length / ratio);
+  const out = new Float32Array(newLen);
+  for (let i = 0; i < newLen; i++) out[i] = f32[Math.floor(i * ratio)] || 0;
+  return out;
+}
+
+function pcmToBase64(f32) {
+  const i16 = new Int16Array(f32.length);
+  for (let i = 0; i < f32.length; i++) {
+    const s = Math.max(-1, Math.min(1, f32[i]));
+    i16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+  }
+  let bin = '';
+  const bytes = new Uint8Array(i16.buffer);
+  for (let i = 0; i < bytes.byteLength; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+
+/* ══════════════════════════════════════════════════════════
+   开始通话
+══════════════════════════════════════════════════════════ */
+startBtn.onclick = async () => {
+  if (startBtn.disabled) return;
+
+  // ✅ 在“开始通话”这个用户手势里就先激活播放用的 AudioContext，
+  // 尽早满足手机浏览器的手势要求，减少后续第一次播放失败的概率
+  ensurePlayCtxFromGesture();
+
+  const lang1 = lang1Sel.value;
+  const lang2 = lang2Sel.value;
+  if (lang1 === lang2) { alert('请选择两种不同的语言'); return; }
+
+  startBtn.disabled = true;
+  messageArea.innerHTML = '';
+  currentItemA = null;
+  currentItemB = null;
+  pendingItems = {};
+  readyA = false;
+  readyB = false;
+  audioPlaying = false;
+  recordingRole = null;
+  isSpeaking = false;
+  silenceFrames = 0;
+  playQueue = [];
+  playCursor = playCtx ? playCtx.currentTime : 0;
+
+  roomId = 'room_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+
+  document.getElementById('startScreen').classList.remove('active');
+  document.getElementById('callScreen').classList.add('active');
+  statusBar.textContent = '⏳ 正在连接...';
+  refreshMicUI();
+
+  try {
+    const [a, b] = await Promise.all([
+      connectWs('a', lang1, lang2),
+      connectWs('b', lang2, lang1)
+    ]);
+    wsA = a;
+    wsB = b;
+    readyA = true;
+    readyB = true;
+    statusBar.textContent = '✅ 已连接，点击麦克风开始说话（静音自动断句）';
+    refreshMicUI();
+    startBtn.disabled = false;
+  } catch (e) {
+    alert('连接失败: ' + e.message);
+    startBtn.disabled = false;
+    exitCall();
+  }
+};
+
+/* ══════════════════════════════════════════════════════════
+   清空 & 退出
+══════════════════════════════════════════════════════════ */
+document.getElementById('clearBtn').onclick = () => {
+  messageArea.innerHTML = '';
+  currentItemA = null;
+  currentItemB = null;
+  pendingItems = {};
+};
+
+function cleanupAll() {
+  recordingRole = null;
+  audioPlaying = false;
+  isSpeaking = false;
+  silenceFrames = 0;
+  clearTimeout(audioDoneTimer);
+  [wsA, wsB].forEach(ws => { try { ws?.close(1000); } catch (e) {} });
+  wsA = wsB = null;
+  readyA = readyB = false;
+  [processorNode, sourceNode].forEach(n => { try { n?.disconnect(); } catch (e) {} });
+  mediaStream?.getTracks().forEach(t => t.stop());
+  try { audioCtx?.close(); } catch (e) {}
+  audioCtx = sourceNode = processorNode = mediaStream = null;
+  playCursor = 0;
+  playQueue = [];
+  currentItemA = null;
+  currentItemB = null;
+  pendingItems = {};
+}
+
+function exitCall() {
+  cleanupAll();
+  document.getElementById('callScreen').classList.remove('active');
+  document.getElementById('startScreen').classList.add('active');
+  messageArea.innerHTML = '';
+  startBtn.disabled = false;
+}
+
+document.getElementById('exitBtn').onclick = () => document.getElementById('exitModal').classList.add('active');
+document.getElementById('modalCancel').onclick = () => document.getElementById('exitModal').classList.remove('active');
+document.getElementById('modalConfirm').onclick = () => {
+  document.getElementById('exitModal').classList.remove('active');
+  exitCall();
+};
+document.getElementById('exitModal').onclick = (e) => {
+  if (e.target === e.currentTarget) document.getElementById('exitModal').classList.remove('active');
+};
+
+/* ══════════════════════════════════════════════════════════
+   保存记录
+══════════════════════════════════════════════════════════ */
+document.getElementById('saveBtn').onclick = () => {
+  const items = messageArea.querySelectorAll('.msg-item');
+  if (!items.length) { alert('当前没有对话记录'); return; }
+  let txt = `双向实时互译记录\n保存时间: ${new Date().toLocaleString()}\n${'='.repeat(40)}\n\n`;
+  items.forEach(item => {
+    const role = item.classList.contains('role-a') ? 'A' : 'B';
+    const orig = item.querySelector('.msg-original')?.textContent || '';
+    const trans = item.querySelector('.msg-translation')?.textContent || '';
+    if (trans.includes('翻译中')) return;
+    txt += `[${role}] ${orig}\n    → ${trans}\n\n`;
+  });
+  const blob = new Blob([txt], { type: 'text/plain;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `互译记录_${new Date().toISOString().slice(0, 10)}.txt`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+};
+
+// ── 兜底：任何点击都尝试激活 AudioContext ──────────
+document.addEventListener('click', function() {
+  ensurePlayCtxFromGesture();
+}, { once: false });
+
+window.addEventListener('beforeunload', cleanupAll);
+</script>
+</body>
+  </html>
