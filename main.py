@@ -148,12 +148,20 @@ async def translate_text(text: str, target_lang: str) -> str:
 def _synthesize_speech_blocking(text: str) -> Optional[bytes]:
     if not text or not DASHSCOPE_API_KEY:
         return None
-    try:
-        synthesizer = SpeechSynthesizer(model=TTS_MODEL, voice=TTS_VOICE)
-        return synthesizer.call(text)
-    except Exception as e:
-        logger.error(f"TTS 失败: {e}")
-        return None
+    last_err = None
+    for attempt in range(1, 3):  # 最多试 2 次，SDK 内部连接池偶发问题重试一次通常就好
+        try:
+            # 官方文档要求：每次调用前重新创建 SpeechSynthesizer 实例
+            synthesizer = SpeechSynthesizer(model=TTS_MODEL, voice=TTS_VOICE)
+            audio = synthesizer.call(text)
+            if audio:
+                return audio
+            logger.warning(f"TTS 第{attempt}次调用返回空音频，text='{text[:20]}...'")
+        except Exception as e:
+            last_err = e
+            logger.error(f"TTS 第{attempt}次调用失败: {type(e).__name__}: {e}", exc_info=True)
+    logger.error(f"TTS 最终失败（已重试）: {last_err}")
+    return None
 
 
 async def synthesize_speech(text: str) -> Optional[bytes]:
