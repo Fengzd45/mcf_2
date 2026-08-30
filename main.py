@@ -5,7 +5,6 @@ import uuid
 import base64
 import asyncio
 import logging
-import requests
 from typing import Dict, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
@@ -38,10 +37,17 @@ if not DASHSCOPE_API_KEY:
     logger.warning("⚠️ 环境变量 DASHSCOPE_API_KEY 未设置！")
 
 ASR_MODEL = "fun-asr-realtime"
-TRANSLATE_URL = "https://dashscope.aliyuncs.com/api/v1/services/machine-translation/translation"
 TRANSLATE_MODEL = "qwen-mt-turbo"
 TTS_MODEL = "cosyvoice-v2"
 TTS_VOICE = "longxiaochun_v2"
+
+# qwen-mt 系列的 translation_options.target_lang 要求完整英文语言名，
+# 不接受 "en"/"zh" 这种短代码，这里做一层映射（覆盖前端语言下拉框的 12 种语言）。
+LANG_NAME_MAP = {
+    "zh": "Chinese", "en": "English", "ja": "Japanese", "ko": "Korean",
+    "fr": "French", "de": "German", "es": "Spanish", "ru": "Russian",
+    "ar": "Arabic", "th": "Thai", "vi": "Vietnamese", "pt": "Portuguese",
+}
 
 # 音频保活看门狗参数（沿用已验证可行的设计）
 WATCHDOG_CHECK_INTERVAL = 5
@@ -114,16 +120,19 @@ class StreamingCallback(RecognitionCallback):
 def _translate_text_blocking(text: str, target_lang: str) -> str:
     if not text or not DASHSCOPE_API_KEY:
         return text
-    headers = {"Authorization": f"Bearer {DASHSCOPE_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": TRANSLATE_MODEL,
-        "input": {"text": text, "source_lang": "auto", "target_lang": target_lang}
-    }
+    target_lang_name = LANG_NAME_MAP.get(target_lang, target_lang)
     try:
-        resp = requests.post(TRANSLATE_URL, headers=headers, json=payload, timeout=30)
-        if resp.status_code == 200:
-            return resp.json().get("output", {}).get("text", text)
-        logger.error(f"翻译请求失败: status={resp.status_code}, body={resp.text[:300]}")
+        response = dashscope.Generation.call(
+            api_key=DASHSCOPE_API_KEY,
+            model=TRANSLATE_MODEL,
+            messages=[{"role": "user", "content": text}],
+            translation_options={"source_lang": "auto", "target_lang": target_lang_name},
+            result_format="message",
+        )
+        if response.status_code == 200:
+            return response.output.choices[0].message.content
+        logger.error(f"翻译请求失败: status={response.status_code}, "
+                     f"code={getattr(response, 'code', '')}, message={getattr(response, 'message', '')}")
         return text
     except Exception as e:
         logger.error(f"翻译异常: {e}")
