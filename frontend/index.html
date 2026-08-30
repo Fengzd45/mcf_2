@@ -359,41 +359,6 @@ html, body {
   <div class="subtitle">点击麦克风键说话 · 静音自动断句 · 译音播完可继续说</div>
 </div>
 
-<!-- ══ 调试面板：不用开发者工具也能看麦克风是否真的在收音 ══ -->
-<div id="debugPanel" style="position:fixed;left:8px;bottom:8px;z-index:9999;
-  background:rgba(0,0,0,0.75);color:#0f0;font:11px/1.5 monospace;
-  padding:8px 10px;border-radius:6px;max-width:260px;white-space:pre;">
-调试面板加载中...
-</div>
-<!-- ══ 事件日志：显示WS收发的每条消息，不用切到Render后台看日志 ══ -->
-<div id="eventLogPanel" style="position:fixed;right:8px;bottom:8px;z-index:9999;
-  background:rgba(0,0,0,0.85);color:#0ff;font:10px/1.4 monospace;
-  padding:8px 10px;border-radius:6px;width:180px;max-height:220px;overflow-y:auto;white-space:pre-wrap;">
-事件日志加载中...
-</div>
-<script>
-const eventLogList = [];
-function logEvent(text) {
-  const t = new Date().toLocaleTimeString('zh-CN', {hour12:false});
-  eventLogList.push(`${t} ${text}`);
-  if (eventLogList.length > 15) eventLogList.shift();
-  const panel = document.getElementById('eventLogPanel');
-  if (panel) panel.textContent = eventLogList.join('\n');
-}
-function updateDebugPanel(rms) {
-  const panel = document.getElementById('debugPanel');
-  if (!panel) return;
-  const track = mediaStream ? mediaStream.getAudioTracks()[0] : null;
-  panel.textContent =
-`麦克风轨道: ${track ? track.readyState : '无'} / muted=${track ? track.muted : '?'}
-onaudioprocess调用次数: ${debugFrameCount}
-已发送音频包数: ${debugChunksSent}
-当前RMS: ${rms.toFixed(5)}
-本段最大RMS: ${debugMaxRms.toFixed(5)} (阈值 ${SILENCE_THRESHOLD})
-isSpeaking: ${isSpeaking}`;
-}
-</script>
-
 
 <!-- ══ 通话屏幕 ══ -->
 <div id="callScreen" class="screen">
@@ -485,9 +450,6 @@ const MAX_RECORDING_MS = 15000;
 let silenceFrames = 0;
 let isSpeaking = false;
 let recordingStartTime = 0;
-let debugMaxRms = 0;
-let debugFrameCount = 0;
-let debugChunksSent = 0;
 let sampleRate = 16000;
 
 let playCtx = null;
@@ -597,18 +559,14 @@ async function ensureMic() {
       if (audioPlaying) return;
       const ws = recordingRole === 'a' ? wsA : wsB;
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
-      debugFrameCount++;
       const data = e.inputBuffer.getChannelData(0);
       const pcm = downsampleTo16k(data, sampleRate);
       const b64 = pcmToBase64(pcm);
       ws.send(JSON.stringify({ type: 'audio', data: b64 }));
-      debugChunksSent++;
 
       let sum = 0;
       for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
       const rms = Math.sqrt(sum / data.length);
-      if (rms > debugMaxRms) debugMaxRms = rms;
-      updateDebugPanel(rms);
 
       if (rms > SILENCE_THRESHOLD) {
         silenceFrames = 0;
@@ -625,7 +583,6 @@ async function ensureMic() {
             isSpeaking = false;
             silenceFrames = 0;
             ws.send(JSON.stringify({ type: 'vad_stop' }));
-            logEvent(`➡ [${recordingRole}] 发送 vad_stop (静音检测触发, readyState=${ws.readyState})`);
             statusBar.textContent = `⏳ 静音断句中...`;
           } else if (silenceFrames > 10) {
             statusBar.textContent = `⏳ 即将断句...`;
@@ -636,13 +593,10 @@ async function ensureMic() {
       // ✅ 兜底：录音时间过长（可能是音量检测不到导致的假"说话中"）强制断句
       if (recordingRole && recordingStartTime &&
           (Date.now() - recordingStartTime) > MAX_RECORDING_MS) {
-        console.warn(`[VAD兜底] 超过 ${MAX_RECORDING_MS}ms 未静音断句，本段最大RMS=${debugMaxRms.toFixed(5)}（阈值=${SILENCE_THRESHOLD}），强制断句`);
         isSpeaking = false;
         silenceFrames = 0;
         recordingStartTime = Date.now();
-        debugMaxRms = 0;
         ws.send(JSON.stringify({ type: 'vad_stop' }));
-        logEvent(`➡ [${recordingRole}] 发送 vad_stop (超时兜底触发, readyState=${ws.readyState})`);
         statusBar.textContent = `⏳ 超时强制断句...`;
       }
     };
@@ -667,9 +621,6 @@ async function startRecording(role) {
   isSpeaking = false;
   silenceFrames = 0;
   recordingStartTime = Date.now();
-  debugMaxRms = 0;
-  debugFrameCount = 0;
-  debugChunksSent = 0;
   refreshMicUI();
   statusBar.textContent = `🎤 ${role.toUpperCase()} 说话中...`;
 }
@@ -798,21 +749,18 @@ function connectWs(role, lang, targetLang) {
     ws.onopen = () => {
       clearTimeout(timer);
       console.log(`✅ ${role} WebSocket 已打开`);
-      logEvent(`✅ [${role}] WS已连接 ${host}`);
       ws.send(JSON.stringify({ type: 'init', lang: lang, target_lang: targetLang }));
     };
     
     ws.onerror = (e) => { 
       clearTimeout(timer); 
       console.error(`❌ ${role} WebSocket 错误:`, e);
-      logEvent(`❌ [${role}] WS错误`);
       reject(new Error(`${role} 连接失败`)); 
     };
     
     ws.onclose = (e) => {
       clearTimeout(timer);
       console.log(`🔌 ${role} WebSocket 已关闭, code=${e.code}`);
-      logEvent(`🔌 [${role}] WS已关闭 code=${e.code}`);
       if (role === 'a') readyA = false;
       else readyB = false;
       refreshMicUI();
@@ -838,7 +786,6 @@ function connectWs(role, lang, targetLang) {
 ══════════════════════════════════════════════════════════ */
 function handleMessage(role, msg) {
   console.log(`📨 [${role}] 收到:`, msg.kind, msg.sid ? `sid=${msg.sid}` : '');
-  logEvent(`⬅ [${role}] ${msg.kind}${msg.text ? ': ' + msg.text.slice(0, 20) : ''}`);
 
   switch (msg.kind) {
 
