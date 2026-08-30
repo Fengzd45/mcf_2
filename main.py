@@ -13,7 +13,10 @@ from contextlib import asynccontextmanager
 
 import dashscope
 from dashscope.audio.asr import Recognition, RecognitionCallback
-from dashscope.audio.tts_v2 import SpeechSynthesizer
+from dashscope.audio.http_tts.http_speech_synthesizer import HttpSpeechSynthesizer
+import requests
+import io
+import wave
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -145,18 +148,43 @@ async def translate_text(text: str, target_lang: str) -> str:
 
 
 # ---------- TTS（阻塞调用，丢线程池） ----------
+# ⚠️ 2026-08-31 改版：cosyvoice-v2 原本走的 tts_v2.SpeechSynthesizer 是 WebSocket
+# 长连接，实测在 Render（境外 IP）上连接建立失败（self.sock 一直是 None），
+# 报 'NoneType' object has no attribute 'close_frame'。
+# 改用非流式的 HTTP 版本 HttpSpeechSynthesizer（走普通 REST 请求，跟已验证
+# 可用的翻译接口是同一类），返回一个 audio_url，再下载一次拿到音频字节。
 def _synthesize_speech_blocking(text: str) -> Optional[bytes]:
     if not text or not DASHSCOPE_API_KEY:
         return None
     last_err = None
-    for attempt in range(1, 3):  # 最多试 2 次，SDK 内部连接池偶发问题重试一次通常就好
+    for attempt in range(1, 3):
         try:
-            # 官方文档要求：每次调用前重新创建 SpeechSynthesizer 实例
-            synthesizer = SpeechSynthesizer(model=TTS_MODEL, voice=TTS_VOICE)
-            audio = synthesizer.call(text)
-            if audio:
-                return audio
-            logger.warning(f"TTS 第{attempt}次调用返回空音频，text='{text[:20]}...'")
+            result = HttpSpeechSynthesizer.call(
+                model=TTS_MODEL,
+                text=text,
+                voice=TTS_VOICE,
+                format="wav",
+                sample_rate=24000,
+                stream=False,
+                api_key=DASHSCOPE_API_KEY,
+            )
+            audio_url = getattr(result, "audio_url", None)
+            if not audio_url:
+                logger.warning(f"TTS 第{attempt}次调用未返回 audio_url，result={result}")
+                continue
+            resp = requests.get(audio_url, timeout=30)
+            if resp.status_code != 200:
+                logger.warning(f"TTS 第{attempt}次下载音频失败: status={resp.status_code}")
+                continue
+            # 前端按裸 16bit PCM 解码播放（不认 WAV 头），这里用 wave 模块
+            # 正确解析出音频帧数据，剥掉头部，避免开头一小段杂音/爆音。
+            try:
+                with wave.open(io.BytesIO(resp.content), "rb") as wf:
+                    pcm_data = wf.readframes(wf.getnframes())
+                return pcm_data
+            except Exception as e:
+                logger.error(f"TTS 第{attempt}次 WAV 解析失败: {e}")
+                continue
         except Exception as e:
             last_err = e
             logger.error(f"TTS 第{attempt}次调用失败: {type(e).__name__}: {e}", exc_info=True)
